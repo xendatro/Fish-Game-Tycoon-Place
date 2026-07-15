@@ -2,7 +2,12 @@ return {
 	Money = 0,
 	Fish = {
 		--[[
-		["FishNameHere"] = true|objectId. objectId is the id of the placed tank they're placed in. true if its not placed
+		{
+			Name = string
+			ObjectId = nil/objectId, --objectId is placed tank
+			Size = "Tiny"|"Small"|"Medium"|"Large"|"Huge",
+			Modifier = string?
+		}
 		]]
 	}
 }
