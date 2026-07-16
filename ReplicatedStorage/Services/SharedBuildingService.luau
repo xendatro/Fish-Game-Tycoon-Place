@@ -53,8 +53,8 @@ end
 --[[Indexes every top-level placeable model under Assets.Placeables by name and height.
 The folder holds category folders of models, so we take Model descendants - but only
 top-level ones (a Model nested inside another Model is a sub-part, not a placeable).
-Duplicate-named models are height variants, distinguished by a numeric Height attribute
-(1..4); models without one are stored as the default variant.]]
+Duplicate-named models are height variants, distinguished by their numeric Height
+level attribute (1..4); models without one are stored as the default variant.]]
 local function gatherModels()
 	local assets = ReplicatedStorage:FindFirstChild("Assets")
 	local placeables = assets and assets:FindFirstChild("Placeables")
@@ -145,14 +145,14 @@ function SharedBuildingService:GetEntry(name: string): CatalogEntry?
 	return catalog[name]
 end
 
---[[Returns the placeable model for a name at a given height level. Falls back to the
-representative model when the exact height variant doesn't exist (or height is nil).]]
+--[[Returns the exact height variant when requested. A missing variant returns nil
+instead of silently rendering a model whose geometry disagrees with grid data.]]
 function SharedBuildingService:GetModel(name: string, height: number?): Model?
 	local variants = modelsByName[name]
 	if not variants then
 		return nil
 	end
-	if height and variants[height] then
+	if height then
 		return variants[height]
 	end
 	return representativeModel(name)
@@ -330,12 +330,7 @@ function SharedBuildingService:GetPlacementCFrame(grid: Grid.Grid, name: string,
 	return CFrame.new(grid:GetCellCenter(x, z) + worldOffset) * rot
 end
 
--- One grid-unit of an object's hitbox, sized to the model, for validity display + queries.
--- Key is the occupancy key (cell or edge) the piece maps to, so callers can check the
--- exact same grid state that blocks placement.
-export type HitboxPiece = { CFrame: CFrame, Size: Vector3, InBounds: boolean, Key: string }
-
--- Cached model extents, keyed by model, so per-frame hitbox sizing doesn't recompute them.
+-- Cached model extents, keyed by model, so repeated height/size lookups don't recompute.
 local modelExtentsCache: { [Model]: Vector3 } = {}
 local function modelExtents(model: Model): Vector3
 	local size = modelExtentsCache[model]
@@ -346,13 +341,212 @@ local function modelExtents(model: Model): Vector3
 	return size
 end
 
+--[[Returns the vertical offset of the floor supporting a placement. Floor 1 is the
+plot surface. Higher floors are ceiling tops; every footprint cell/edge must have a
+ceiling beneath it at one consistent height.]]
+function SharedBuildingService:GetFloorOffset(
+	grid: Grid.Grid,
+	name: string,
+	x: number,
+	z: number,
+	floor: number,
+	rotation: number
+): (number?, string?)
+	if floor == 1 then
+		return 0
+	end
+
+	local entry = catalog[name]
+	if not entry then
+		return nil, "unknown asset"
+	end
+
+	local supportTopOffset: number? = nil
+	local function addSupport(topOffset: number?): boolean
+		if not topOffset then
+			return false
+		end
+		if supportTopOffset and supportTopOffset ~= topOffset then
+			return false
+		end
+		supportTopOffset = topOffset
+		return true
+	end
+
+	if entry.Type == "Wall" then
+		local length = entry.Footprint.Width
+		local pi = pivotIndex(length)
+		local orientation, ex, ez = wallEdgeParams(x, z, rotation)
+		for i = 0, length - 1 do
+			local offset = i - pi
+			local first, second, belowEdgeKey
+			if orientation == "H" then
+				first = grid:GetCeiling(ex + offset, ez, floor - 1)
+				second = grid:GetCeiling(ex + offset, ez - 1, floor - 1)
+				belowEdgeKey = Grid.edgeKey("H", ex + offset, ez, floor - 1)
+			else
+				first = grid:GetCeiling(ex, ez + offset, floor - 1)
+				second = grid:GetCeiling(ex - 1, ez + offset, floor - 1)
+				belowEdgeKey = Grid.edgeKey("V", ex, ez + offset, floor - 1)
+			end
+			local ceilingTop = math.max(if first then first.TopOffset else 0, if second then second.TopOffset else 0)
+
+			-- A wall directly below on the same edge supports stacking: rest on its top.
+			local belowId = grid:GetEdgeOccupant(belowEdgeKey)
+			local belowWall = belowId and grid:GetPlacement(belowId)
+			local wallTop = (belowWall and self:GetPlacementTopOffset(grid, belowWall)) or 0
+
+			local topOffset = math.max(ceilingTop, wallTop)
+			if topOffset == 0 or not addSupport(topOffset) then
+				return nil, if topOffset == 0 then "needs floor below" else "floor is uneven"
+			end
+		end
+	else
+		for _, coord in computeCellCoords(entry, x, z, rotation) do
+			local ceiling = grid:GetCeiling(coord[1], coord[2], floor - 1)
+			if not ceiling or not addSupport(ceiling.TopOffset) then
+				return nil, if not ceiling then "needs floor below" else "floor is uneven"
+			end
+		end
+	end
+
+	return supportTopOffset
+end
+
+--[[Returns a placement's TOP-surface offset above Origin.Y: its own floor offset plus its
+measured model height. Used to stack walls and to snap ceilings flush to a wall top.]]
+function SharedBuildingService:GetPlacementTopOffset(grid: Grid.Grid, placement: Grid.Placement): number?
+	local floorOffset = self:GetFloorOffset(grid, placement.Name, placement.X, placement.Z, placement.Floor, placement.Rotation)
+	local model = self:GetModel(placement.Name, placement.Height)
+	local height = model and modelExtents(model).Y
+	if floorOffset and height then
+		return floorOffset + height
+	end
+	return nil
+end
+
+local shortestWallHeight: number? = nil
+--[[Returns the measured height of the shortest wall model in the catalog. Used as the
+default per-floor surface height for previews (a floor N sits ~(N-1) walls up). Cached.]]
+function SharedBuildingService:GetShortestWallHeight(): number
+	if shortestWallHeight then
+		return shortestWallHeight
+	end
+	local shortest: number? = nil
+	for name, entry in catalog do
+		if entry.Type ~= "Wall" then
+			continue
+		end
+		local variants = modelsByName[name]
+		if variants then
+			for _, model in variants do
+				local h = modelExtents(model).Y
+				if not shortest or h < shortest then
+					shortest = h
+				end
+			end
+		end
+	end
+	shortestWallHeight = shortest or Building.HEIGHT_STUDS[1]
+	return shortestWallHeight
+end
+
+--[[Returns the ceiling's TOP surface offset - flush with the highest bordering wall top.
+With no bordering wall, an adjacent same-floor ceiling supplies the top offset for spreading.]]
+function SharedBuildingService:GetCeilingTopOffset(grid: Grid.Grid, x: number, z: number, floor: number): number?
+	local wallTop: number? = nil
+	local function considerWall(topOffset: number?)
+		if topOffset and (not wallTop or topOffset > wallTop) then
+			wallTop = topOffset
+		end
+	end
+
+	for _, key in {
+		Grid.edgeKey("H", x, z, floor),
+		Grid.edgeKey("H", x, z + 1, floor),
+		Grid.edgeKey("V", x, z, floor),
+		Grid.edgeKey("V", x + 1, z, floor),
+	} do
+		local id = grid:GetEdgeOccupant(key)
+		local placement = id and grid:GetPlacement(id)
+		if placement then
+			-- Snap to the wall's actual (measured) top, so the ceiling top is flush with it.
+			considerWall(self:GetPlacementTopOffset(grid, placement))
+		end
+	end
+	if wallTop then
+		return wallTop
+	end
+
+	local adjacentTop: number? = nil
+	for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
+		local ceiling = grid:GetCeiling(x + offset[1], z + offset[2], floor)
+		if ceiling and (not adjacentTop or ceiling.TopOffset > adjacentTop) then
+			adjacentTop = ceiling.TopOffset
+		end
+	end
+
+	return adjacentTop
+end
+
+--[[Returns every distinct ceiling top offset a cell could snap to (each bordering wall's
+top, plus adjacent same-floor ceilings), sorted ascending. When a tile borders walls of
+different heights this has multiple entries, and the client picks one from where the mouse
+is aiming; the server validates the chosen offset against this list.]]
+function SharedBuildingService:GetCeilingSupportOffsets(grid: Grid.Grid, x: number, z: number, floor: number): { number }
+	local offsets: { number } = {}
+	local seen: { [number]: boolean } = {}
+	local function add(offset: number?)
+		if offset and not seen[offset] then
+			seen[offset] = true
+			table.insert(offsets, offset)
+		end
+	end
+
+	for _, key in {
+		Grid.edgeKey("H", x, z, floor),
+		Grid.edgeKey("H", x, z + 1, floor),
+		Grid.edgeKey("V", x, z, floor),
+		Grid.edgeKey("V", x + 1, z, floor),
+	} do
+		local id = grid:GetEdgeOccupant(key)
+		local placement = id and grid:GetPlacement(id)
+		if placement then
+			add(self:GetPlacementTopOffset(grid, placement))
+		end
+	end
+	for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
+		local ceiling = grid:GetCeiling(x + offset[1], z + offset[2], floor)
+		if ceiling then
+			add(ceiling.TopOffset)
+		end
+	end
+
+	table.sort(offsets)
+	return offsets
+end
+
+-- One grid-unit of an object's hitbox, sized to the model, for validity display + queries.
+-- Key is the occupancy key (cell or edge) the piece maps to, so callers can check the
+-- exact same grid state that blocks placement.
+export type HitboxPiece = { CFrame: CFrame, Size: Vector3, InBounds: boolean, Key: string }
+
 --[[
 Returns the hitbox pieces for a placement: one per occupied cell for content, one per
 edge segment for walls. Each is sized to the placement's actual height-variant model
 (height = model height; walls use the model's thin dimension as thickness), carries the
 occupancy Key it maps to, and flags whether it's inside the plot.
 ]]
-function SharedBuildingService:GetHitboxPieces(grid: Grid.Grid, name: string, x: number, z: number, floor: number, rotation: number, height: number?): { HitboxPiece }
+function SharedBuildingService:GetHitboxPieces(
+	grid: Grid.Grid,
+	name: string,
+	x: number,
+	z: number,
+	floor: number,
+	rotation: number,
+	height: number?,
+	previewFloorOffset: number?
+): { HitboxPiece }
 	local entry = catalog[name]
 	if not entry then
 		return {}
@@ -363,6 +557,7 @@ function SharedBuildingService:GetHitboxPieces(grid: Grid.Grid, name: string, x:
 	local modelSize = if model then modelExtents(model) else (entry.ModelSize or Vector3.new(cell, cell, cell))
 	local h = modelSize.Y
 	local origin = grid.Origin
+	local floorOffset = self:GetFloorOffset(grid, name, x, z, floor, rotation) or previewFloorOffset or 0
 	local yaw = math.rad(-90 * rotation)
 	local pieces: { HitboxPiece } = {}
 
@@ -387,7 +582,7 @@ function SharedBuildingService:GetHitboxPieces(grid: Grid.Grid, name: string, x:
 				key = Grid.edgeKey("V", ex, ez + offset, floor)
 			end
 			table.insert(pieces, {
-				CFrame = CFrame.new(centreX, origin.Y + h / 2, centreZ) * CFrame.Angles(0, yaw, 0),
+				CFrame = CFrame.new(centreX, origin.Y + floorOffset + h / 2, centreZ) * CFrame.Angles(0, yaw, 0),
 				Size = Vector3.new(cell, h, thickness),
 				InBounds = inBounds,
 				Key = key,
@@ -397,7 +592,7 @@ function SharedBuildingService:GetHitboxPieces(grid: Grid.Grid, name: string, x:
 		for _, coord in computeCellCoords(entry, x, z, rotation) do
 			local centre = grid:GetCellCenter(coord[1], coord[2])
 			table.insert(pieces, {
-				CFrame = CFrame.new(centre.X, origin.Y + h / 2, centre.Z),
+				CFrame = CFrame.new(centre.X, origin.Y + floorOffset + h / 2, centre.Z),
 				Size = Vector3.new(cell, h, cell),
 				InBounds = grid:IsInBounds(coord[1], coord[2]),
 				Key = Grid.cellKey(coord[1], coord[2], floor),
@@ -434,18 +629,24 @@ function SharedBuildingService:CanPlace(
 		return false, "invalid floor"
 	end
 
-	if entry.Extendable and height ~= nil then
-		if height < 1 or height > Building.MAX_HEIGHT_LEVEL then
-			return false, "invalid height level"
-		end
+	if entry.Extendable and (not height or not table.find(entry.Heights :: { number }, height)) then
+		return false, "invalid height level"
 	end
-
+	if entry.Extendable and not self:GetModel(name, height) then
+		return false, "missing height model"
+	end
 	local cells, edges = self:ResolveOccupancy(name, x, z, floor, rotation, height)
 
 	-- Bounds: every cell of the (rotated) footprint must be inside the plot.
 	for _, coord in computeCellCoords(entry, x, z, rotation) do
 		if not grid:IsInBounds(coord[1], coord[2]) then
 			return false, "out of bounds"
+		end
+	end
+	if floor > 1 then
+		local _, reason = self:GetFloorOffset(grid, name, x, z, floor, rotation)
+		if reason then
+			return false, reason
 		end
 	end
 
@@ -457,8 +658,7 @@ function SharedBuildingService:CanPlace(
 	end
 
 	-- TODO(doc rules):
-	--   * Content/walls must initially rest on a floor; hangers on a ceiling.
-	--   * Ceilings must match the height of an adjacent wall/stair top or ceiling.
+	--   * Hangers must attach beneath a ceiling.
 	--   * NPC-interactable assets need >= 1 empty clearance cell.
 	--   * Walls cannot be penetrated by content (edge-vs-cell adjacency check).
 	--   * Money check happens server-side in ServerBuildingService.

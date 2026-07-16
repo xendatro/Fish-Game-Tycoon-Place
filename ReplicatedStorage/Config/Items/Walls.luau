@@ -18,4 +18,8 @@ return {
 		Heights = {1,2,3,4},
 		Type = "Wall",
 	},
+	
+	TestWall = {
+		Type = "Wall",
+	}
 }

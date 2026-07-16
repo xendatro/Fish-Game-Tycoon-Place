@@ -40,14 +40,15 @@ export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot, heig
 -- Painted floor material (index into Config.Materials.Floor), per floor + cell. Grass
 -- (index 1) is the default and never stored.
 export type FloorEntry = { Floor: number, X: number, Z: number, Material: number }
--- A ceiling capping a cell: its height level and underside material index.
-export type CeilingEntry = { X: number, Z: number, Height: number, Material: number }
+-- A ceiling capping one build floor at a cell. TopOffset is its top surface's height
+-- above Origin.Y; floor 2 ceilings are roofs and do not create a third build floor.
+export type CeilingEntry = { Floor: number, X: number, Z: number, TopOffset: number, Material: number }
 
 export type SaveBlob = {
 	Palette: { string },
 	Placements: { SavedPlacement },
 	Floors: { { number } }, -- {floor, x, z, materialIndex}
-	Ceilings: { { number } }, -- {x, z, heightLevel, materialIndex}
+	Ceilings: { { number } }, -- {floor, x, z, topOffsetStuds, materialIndex}
 }
 
 export type Grid = typeof(setmetatable(
@@ -59,7 +60,7 @@ export type Grid = typeof(setmetatable(
 		_cellIndex: { [string]: number }, -- cell key -> placement id
 		_edgeIndex: { [string]: number }, -- edge key -> placement id
 		_floors: { [string]: FloorEntry }, -- cell key -> painted floor material
-		_ceilings: { [string]: CeilingEntry }, -- "x,z" -> ceiling
+		_ceilings: { [string]: CeilingEntry }, -- "floor:x,z" -> ceiling
 		_nextId: number,
 	},
 	Grid
@@ -197,24 +198,30 @@ end
 
 -- ===== Ceiling layer ========================================================
 
---[[Canonical key for the ceiling that caps a cell (one per column between the floors).]]
-function Grid.ceilingKey(x: number, z: number): string
-	return `{x},{z}`
+--[[Canonical key for the ceiling capping a cell on one build floor.]]
+function Grid.ceilingKey(x: number, z: number, floor: number): string
+	return `{floor}:{x},{z}`
 end
 
 --[[Adds/updates the ceiling capping a cell.]]
-function Grid:SetCeiling(x: number, z: number, height: number, material: number)
-	self._ceilings[Grid.ceilingKey(x, z)] = { X = x, Z = z, Height = height, Material = material }
+function Grid:SetCeiling(x: number, z: number, floor: number, topOffset: number, material: number)
+	self._ceilings[Grid.ceilingKey(x, z, floor)] = {
+		Floor = floor,
+		X = x,
+		Z = z,
+		TopOffset = topOffset,
+		Material = material,
+	}
 end
 
 --[[Returns the ceiling capping a cell, or nil.]]
-function Grid:GetCeiling(x: number, z: number): CeilingEntry?
-	return self._ceilings[Grid.ceilingKey(x, z)]
+function Grid:GetCeiling(x: number, z: number, floor: number): CeilingEntry?
+	return self._ceilings[Grid.ceilingKey(x, z, floor)]
 end
 
 --[[Removes the ceiling capping a cell. Returns whether one was present.]]
-function Grid:RemoveCeiling(x: number, z: number): boolean
-	local key = Grid.ceilingKey(x, z)
+function Grid:RemoveCeiling(x: number, z: number, floor: number): boolean
+	local key = Grid.ceilingKey(x, z, floor)
 	if self._ceilings[key] then
 		self._ceilings[key] = nil
 		return true
@@ -329,7 +336,7 @@ function Grid:Compress(): SaveBlob
 
 	local ceilings: { { number } } = {}
 	for _, entry in self._ceilings do
-		table.insert(ceilings, { entry.X, entry.Z, entry.Height, entry.Material })
+		table.insert(ceilings, { entry.Floor, entry.X, entry.Z, entry.TopOffset, entry.Material })
 	end
 
 	return { Palette = palette, Placements = placements, Floors = floors, Ceilings = ceilings }
@@ -377,7 +384,12 @@ function Grid.Decompress(
 	end
 
 	for _, tuple in blob.Ceilings or {} do
-		self:SetCeiling(tuple[1], tuple[2], tuple[3], tuple[4])
+		if #tuple >= 5 then
+			self:SetCeiling(tuple[2], tuple[3], tuple[1], tuple[4], tuple[5])
+		else
+			-- Legacy ceiling tuple: {x, z, heightLevel, materialIndex}.
+			self:SetCeiling(tuple[1], tuple[2], 1, Building.HEIGHT_STUDS[tuple[3]], tuple[4])
+		end
 	end
 
 	return self

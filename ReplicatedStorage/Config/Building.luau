@@ -21,9 +21,8 @@ Building.HEIGHT_STUDS = {
 }
 Building.MAX_HEIGHT_LEVEL = 4
 
--- How far a ceiling tile hangs below the grid line. The ceiling's TOP aligns with
--- the grid line (= bottom of the next floor), so the whole thickness sits below it.
--- Ceiling hangers must offset by this same amount. (Caden: tweak to taste.)
+-- Ceiling/floor slab thickness. The slab's TOP is flush with the supporting wall top
+-- (which becomes the next build floor's surface); its thickness hangs below that line.
 Building.CEILING_THICKNESS = 1
 
 -- Number of buildable floors. Floor 2 lives at variable heights (determined by the

@@ -79,19 +79,20 @@ local function render(plot, placement)
 		clone:SetAttribute("Height", placement.Height)
 	end
 
-	-- Footprint-centred CFrame on the floor surface; raise the model by half its height
-	-- so it rests on the surface (assumes the model's pivot is at its bounding-box centre).
+	-- Footprint-centred CFrame on the plot surface; raise it to the selected floor and
+	-- by half its height (assumes the pivot is at the bounding-box centre).
 	local groundCF = SharedBuildingService:GetPlacementCFrame(grid, placement.Name, placement.X, placement.Z, placement.Rotation)
 	if groundCF then
 		local _, size = clone:GetBoundingBox()
-		local yOffset = size.Y / 2
-		-- Floor 2 rests on the ceiling capping the pivot cell, if there is one.
-		if placement.Floor == 2 then
-			local ceiling = grid:GetCeiling(placement.X, placement.Z)
-			if ceiling then
-				yOffset += Building.HEIGHT_STUDS[ceiling.Height]
-			end
-		end
+		local floorOffset = SharedBuildingService:GetFloorOffset(
+			grid,
+			placement.Name,
+			placement.X,
+			placement.Z,
+			placement.Floor,
+			placement.Rotation
+		) or 0
+		local yOffset = floorOffset + size.Y / 2
 		clone:PivotTo(groundCF + Vector3.new(0, yOffset, 0))
 	end
 
@@ -132,11 +133,11 @@ local function floorTileAt(grid, x: number, z: number, floor: number): ({ Materi
 	if floor == 1 then
 		return { Material = material, TopY = grid.Origin.Y }
 	end
-	local ceiling = grid:GetCeiling(x, z)
+	local ceiling = grid:GetCeiling(x, z, 1)
 	if not ceiling then
 		return nil
 	end
-	return { Material = material, TopY = grid.Origin.Y + Building.HEIGHT_STUDS[ceiling.Height] }
+	return { Material = material, TopY = grid.Origin.Y + ceiling.TopOffset }
 end
 
 --[[
@@ -232,69 +233,36 @@ local function getCeilingContainer(plot): Folder
 	return container
 end
 
---[[
-Returns the highest support height level available to a ceiling at a cell, or nil if
-there's none. Support = any wall on the cell's four edges, or any ceiling on an adjacent
-cell (so ceilings can spread from a wall). "Snaps to the highest" = we take the max.
-]]
-local function highestSupport(grid, x: number, z: number): number?
-	local best: number? = nil
-	local function consider(height: number?)
-		if height and (not best or height > best) then
-			best = height
-		end
-	end
-
-	-- Walls on the four edges (walls live on floor 1).
-	local edges = {
-		Grid.edgeKey("H", x, z, 1),
-		Grid.edgeKey("H", x, z + 1, 1),
-		Grid.edgeKey("V", x, z, 1),
-		Grid.edgeKey("V", x + 1, z, 1),
-	}
-	for _, key in edges do
-		local id = grid:GetEdgeOccupant(key)
-		if id then
-			local placement = grid:GetPlacement(id)
-			consider(placement and placement.Height)
-		end
-	end
-
-	-- Adjacent ceilings.
-	for _, d in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
-		local ceiling = grid:GetCeiling(x + d[1], z + d[2])
-		consider(ceiling and ceiling.Height)
-	end
-
-	return best
-end
-
---[[Renders (or re-renders) a ceiling slab: a cell-sized slab whose TOP sits at the grid
-line for its height level and whose thickness hangs below, textured with the ceiling
-material on its underside.]]
-local function renderCeiling(plot, x: number, z: number, height: number, materialIndex: number)
+--[[Renders a cell-sized ceiling slab from its stored top-surface offset. Its top is flush
+with the supporting wall top (the next floor surface) and the thickness hangs below it.]]
+local function renderCeiling(plot, x: number, z: number, floor: number, topOffset: number, materialIndex: number)
 	local container = getCeilingContainer(plot)
-	local key = Grid.ceilingKey(x, z)
+	local key = Grid.ceilingKey(x, z, floor)
 	local slab = container:FindFirstChild(key)
 
 	local grid = plot:GetGrid()
 	local centre = grid:GetCellCenter(x, z)
-	local topY = grid.Origin.Y + Building.HEIGHT_STUDS[height]
+	local topY = grid.Origin.Y + topOffset
 
 	if not slab then
 		slab = Instance.new("Part")
 		slab.Name = key
 		slab.Anchored = true
 		slab.Size = Vector3.new(Building.CELL_SIZE, Building.CEILING_THICKNESS, Building.CELL_SIZE)
-		slab.Parent = container
 	end
+	slab:SetAttribute("GridX", x)
+	slab:SetAttribute("GridZ", z)
+	slab:SetAttribute("Floor", floor)
+	slab:SetAttribute("TopOffset", topOffset)
+	slab:SetAttribute("MaterialIndex", materialIndex)
 	slab.Material = (Enum.Material :: any)[Materials.Ceiling[materialIndex]]
 	slab.CFrame = CFrame.new(centre.X, topY - Building.CEILING_THICKNESS / 2, centre.Z)
+	slab.Parent = container
 end
 
 --[[Removes a ceiling slab.]]
-local function derenderCeiling(plot, x: number, z: number)
-	local slab = getCeilingContainer(plot):FindFirstChild(Grid.ceilingKey(x, z))
+local function derenderCeiling(plot, x: number, z: number, floor: number)
+	local slab = getCeilingContainer(plot):FindFirstChild(Grid.ceilingKey(x, z, floor))
 	if slab then
 		slab:Destroy()
 	end
@@ -385,7 +353,7 @@ function ServerBuildingService:PaintFloor(player: Player, x: number, z: number, 
 	if not grid:IsInBounds(x, z) then
 		return false, "out of bounds"
 	end
-	if floor == 2 and not grid:GetCeiling(x, z) then
+	if floor == 2 and not grid:GetCeiling(x, z, 1) then
 		return false, "no ceiling here"
 	end
 
@@ -397,10 +365,17 @@ end
 
 --[[
 Places a ceiling at a cell. Requires support (a bordering wall or adjacent ceiling) and
-snaps to the highest available height level. The ceiling's top becomes floor 2 at that
-cell. Returns success + reason.
+snaps to the highest world-space support top on the selected floor. Floor 1 ceilings
+become floor 2; floor 2 ceilings are roof-only. Returns success + reason.
 ]]
-function ServerBuildingService:PlaceCeiling(player: Player, x: number, z: number, materialIndex: number): (boolean, string?)
+function ServerBuildingService:PlaceCeiling(
+	player: Player,
+	x: number,
+	z: number,
+	floor: number,
+	materialIndex: number,
+	desiredTopOffset: number?
+): (boolean, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
 		return false, "no plot"
@@ -408,44 +383,56 @@ function ServerBuildingService:PlaceCeiling(player: Player, x: number, z: number
 	if materialIndex < 1 or materialIndex > #Materials.Ceiling then
 		return false, "invalid material"
 	end
+	if floor < 1 or floor > Building.FLOOR_COUNT then
+		return false, "invalid floor"
+	end
 
 	local grid = plot:GetGrid()
 	if not grid:IsInBounds(x, z) then
 		return false, "out of bounds"
 	end
-	if grid:GetCeiling(x, z) then
+	if grid:GetCeiling(x, z, floor) then
 		return false, "ceiling already here"
 	end
 
-	local height = highestSupport(grid, x, z)
-	if not height then
+	-- Honour the client's mouse-chosen height if it's a real support option; else snap to
+	-- the highest.
+	local topOffset
+	if desiredTopOffset and table.find(SharedBuildingService:GetCeilingSupportOffsets(grid, x, z, floor), desiredTopOffset) then
+		topOffset = desiredTopOffset
+	else
+		topOffset = SharedBuildingService:GetCeilingTopOffset(grid, x, z, floor)
+	end
+	if not topOffset then
 		return false, "needs a wall or ceiling"
 	end
 
-	grid:SetCeiling(x, z, height, materialIndex)
-	renderCeiling(plot, x, z, height, materialIndex)
+	grid:SetCeiling(x, z, floor, topOffset, materialIndex)
+	renderCeiling(plot, x, z, floor, topOffset, materialIndex)
 	persist(plot)
 	return true
 end
 
 --[[
-Removes a ceiling and its floor-2 tile as one unit (the ceiling+floor combo). Returns
-success.
+Removes a ceiling. Removing a floor 1 ceiling also clears its floor-2 paint tile;
+removing a floor 2 roof does not affect a buildable floor. Returns success.
 ]]
-function ServerBuildingService:RemoveCeiling(player: Player, x: number, z: number): boolean
+function ServerBuildingService:RemoveCeiling(player: Player, x: number, z: number, floor: number): boolean
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
 		return false
 	end
 
 	local grid = plot:GetGrid()
-	if not grid:RemoveCeiling(x, z) then
+	if not grid:RemoveCeiling(x, z, floor) then
 		return false
 	end
 
-	grid:SetFloorMaterial(x, z, 2, 1) -- clear the floor-2 tile that sat on top
-	derenderCeiling(plot, x, z)
-	remeshFloor(plot, 2)
+	if floor == 1 then
+		grid:SetFloorMaterial(x, z, 2, 1) -- clear the floor-2 tile that sat on top
+		remeshFloor(plot, 2)
+	end
+	derenderCeiling(plot, x, z, floor)
 	persist(plot)
 	return true
 end
@@ -481,17 +468,20 @@ paintRemote.OnServerInvoke = function(player, x, z, floor, materialIndex)
 	return ServerBuildingService:PaintFloor(player, x, z, floor, materialIndex)
 end
 
-ceilingRemote.OnServerInvoke = function(player, action, x, z, materialIndex)
-	if not (isFiniteNumber(x) and isFiniteNumber(z)) then
+ceilingRemote.OnServerInvoke = function(player, action, x, z, floor, materialIndex, desiredTopOffset)
+	if not (isFiniteNumber(x) and isFiniteNumber(z) and isFiniteNumber(floor)) then
 		return false
 	end
 	if action == "place" then
 		if not isFiniteNumber(materialIndex) then
 			return false
 		end
-		return ServerBuildingService:PlaceCeiling(player, x, z, materialIndex)
+		if desiredTopOffset ~= nil and not isFiniteNumber(desiredTopOffset) then
+			return false
+		end
+		return ServerBuildingService:PlaceCeiling(player, x, z, floor, materialIndex, desiredTopOffset)
 	elseif action == "remove" then
-		return ServerBuildingService:RemoveCeiling(player, x, z)
+		return ServerBuildingService:RemoveCeiling(player, x, z, floor)
 	end
 	return false
 end
