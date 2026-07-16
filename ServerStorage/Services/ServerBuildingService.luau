@@ -343,25 +343,32 @@ function ServerBuildingService:Place(player: Player, name: string, requests: { P
 end
 
 --[[
-Removes a placement by id. The id comes from the PlacementId attribute on the rendered
+Removes placements by id. Each id comes from the PlacementId attribute on a rendered
 instance (which the client can read), so this works for any type - content or walls
 (which live on edges and can't be found by a cell lookup). Only ids in the player's own
 plot grid exist there, so a client can only remove its own builds. Returns success.
 ]]
-function ServerBuildingService:Remove(player: Player, placementId: number): boolean
+function ServerBuildingService:Remove(player: Player, placementIds: { number }): number
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
-		return false
+		return 0
 	end
-
-	local removed = plot:GetGrid():RemovePlacement(placementId)
-	if not removed then
-		return false
+	local grid = plot:GetGrid()
+	if #placementIds < 1 or #placementIds > grid.Width * grid.Depth then
+		return 0
 	end
-
-	derender(plot, placementId)
-	persist(plot)
-	return true
+	local removed, seen = 0, {}
+	for _, placementId in placementIds do
+		if not seen[placementId] and grid:RemovePlacement(placementId) then
+			seen[placementId] = true
+			derender(plot, placementId)
+			removed += 1
+		end
+	end
+	if removed > 0 then
+		persist(plot)
+	end
+	return removed
 end
 
 --[[Paints every valid request and remeshes once. A click sends one request.]]
@@ -439,22 +446,31 @@ end
 --[[
 Removes a ceiling and clears the painted tile that rested on it one level above.
 ]]
-function ServerBuildingService:RemoveCeiling(player: Player, x: number, z: number, floor: number): boolean
+function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellRequest }, floor: number): number
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
-		return false
+		return 0
 	end
 
 	local grid = plot:GetGrid()
-	if not grid:RemoveCeiling(x, z, floor) then
-		return false
+	if floor < 1 or floor % 1 ~= 0 or #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0
 	end
-
-	grid:SetFloorMaterial(x, z, floor + 1, 1)
-	remeshFloor(plot, floor + 1)
-	derenderCeiling(plot, x, z, floor)
-	persist(plot)
-	return true
+	local removed, seen = 0, {}
+	for _, request in requests do
+		local key = `{request.X},{request.Z}`
+		if not seen[key] and grid:RemoveCeiling(request.X, request.Z, floor) then
+			grid:SetFloorMaterial(request.X, request.Z, floor + 1, 1)
+			derenderCeiling(plot, request.X, request.Z, floor)
+			removed += 1
+		end
+		seen[key] = true
+	end
+	if removed > 0 then
+		remeshFloor(plot, floor + 1)
+		persist(plot)
+	end
+	return removed
 end
 
 -- Client entry points (RemoteFunctions so the client gets accept/reject feedback for
@@ -467,11 +483,11 @@ placeRemote.OnServerInvoke = function(player, name, requests)
 	return ServerBuildingService:Place(player, name, requests)
 end
 
-removeRemote.OnServerInvoke = function(player, placementId)
-	if not isGridInteger(placementId) then
-		return false
+removeRemote.OnServerInvoke = function(player, placementIds)
+	if not isRequestList(placementIds, isGridInteger) then
+		return 0
 	end
-	return ServerBuildingService:Remove(player, placementId)
+	return ServerBuildingService:Remove(player, placementIds)
 end
 
 paintRemote.OnServerInvoke = function(player, requests, floor, materialIndex)
@@ -488,8 +504,8 @@ ceilingRemote.OnServerInvoke = function(player, action, target, second, third)
 		end
 		return ServerBuildingService:PlaceCeiling(player, target, second, third)
 	elseif action == "remove" then
-		if isGridInteger(target) and isGridInteger(second) and isGridInteger(third) then
-			return ServerBuildingService:RemoveCeiling(player, target, second, third)
+		if isRequestList(target, isCellRequest) and isGridInteger(second) then
+			return ServerBuildingService:RemoveCeiling(player, target, second)
 		end
 	end
 	return false

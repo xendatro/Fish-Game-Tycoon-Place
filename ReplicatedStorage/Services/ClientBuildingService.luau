@@ -45,7 +45,7 @@ end
 
 --[[Requests removal of a placement by id (read from the rendered instance). Returns success.]]
 function ClientBuildingService:RequestRemove(placementId: number): boolean
-	return removeRemote:InvokeServer(placementId)
+	return removeRemote:InvokeServer({ placementId }) > 0
 end
 
 --[[Requests painting a cell's floor material. Returns success + reason.]]
@@ -62,7 +62,7 @@ end
 
 --[[Requests removing the ceiling on one selected build floor.]]
 function ClientBuildingService:RequestRemoveCeiling(x: number, z: number, floor: number): boolean
-	return ceilingRemote:InvokeServer("remove", x, z, floor)
+	return ceilingRemote:InvokeServer("remove", { { X = x, Z = z } }, floor) > 0
 end
 
 -- ===========================================================================
@@ -101,9 +101,26 @@ type DragState = {
 }
 local dragState: DragState? = nil
 
+type DeleteDragState = {
+	Kind: "Placement" | "Ceiling" | "Floor",
+	StartX: number,
+	StartZ: number,
+	LastX: number,
+	LastZ: number,
+	Floor: number,
+	PlaneY: number,
+	Rotation: number,
+	Name: string?,
+	ItemType: string?,
+	DragMode: "Line" | "Area",
+	MovedAway: boolean,
+}
+local deleteDragState: DeleteDragState? = nil
+
 --[[Clears every non-place mode. Callers then set the one they want.]]
 local function clearModes()
 	dragState = nil
+	deleteDragState = nil
 	deleteMode = false
 	paintMode = false
 	ceilingMode = false
@@ -150,15 +167,23 @@ local function hideIndicators()
 	end
 end
 
--- Red outline shown around the placement the cursor would delete.
-local deleteHighlight = Instance.new("SelectionBox")
-deleteHighlight.Name = "BuildingDeleteHighlight"
-deleteHighlight.Color3 = Color3.fromRGB(220, 60, 60)
-deleteHighlight.LineThickness = 0.06
-deleteHighlight.SurfaceColor3 = Color3.fromRGB(220, 60, 60)
-deleteHighlight.SurfaceTransparency = 0.85
-deleteHighlight.Visible = false
-deleteHighlight.Parent = indicatorFolder
+-- Pooled red outlines for click and drag deletion previews.
+local deleteHighlights: { SelectionBox } = {}
+
+local function getDeleteHighlight(index: number): SelectionBox
+	local highlight = deleteHighlights[index]
+	if not highlight then
+		highlight = Instance.new("SelectionBox")
+		highlight.Name = "BuildingDeleteHighlight"
+		highlight.Color3 = Color3.fromRGB(220, 60, 60)
+		highlight.LineThickness = 0.06
+		highlight.SurfaceColor3 = Color3.fromRGB(220, 60, 60)
+		highlight.SurfaceTransparency = 0.85
+		highlight.Parent = indicatorFolder
+		deleteHighlights[index] = highlight
+	end
+	return highlight
+end
 
 -- Pooled per-cell previews shared by floor painting and ceiling placement.
 local tilePreviews: { BasePart } = {}
@@ -217,19 +242,54 @@ local function findCeilingPart(instance: Instance?): BasePart?
 end
 
 local function hideDeleteHighlight()
-	deleteHighlight.Adornee = nil
-	deleteHighlight.Visible = false
+	for _, highlight in deleteHighlights do
+		highlight.Adornee = nil
+		highlight.Visible = false
+	end
 end
 
---[[Outlines the placement under the cursor (in delete mode) so it's clear what a click
-would remove.]]
-local function updateDeleteHighlight()
+local function setDeleteHighlights(targets: { Model | BasePart })
+	for index, target in targets do
+		local highlight = getDeleteHighlight(index)
+		highlight.Adornee = target
+		highlight.Visible = true
+	end
+	for index = #targets + 1, #deleteHighlights do
+		deleteHighlights[index].Adornee = nil
+		deleteHighlights[index].Visible = false
+	end
+end
+
+-- Delete targeting ignores only parts hidden by the build camera. Their CanQuery state
+-- remains untouched for every other system.
+local function deleteRaycast(): (Instance?, Vector3?)
+	local ignored: { Instance } = { indicatorFolder }
+	local plane = Workspace:FindFirstChild("BuildGridPlane")
+	if plane then
+		table.insert(ignored, plane)
+	end
+	if player.Character then
+		table.insert(ignored, player.Character)
+	end
+	for _, part in cameraController:GetHiddenParts() do
+		table.insert(ignored, part)
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignored
+	local ray = player:GetMouse().UnitRay
+	local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
+	return if result then result.Instance else nil, if result then result.Position else nil
+end
+
+--[[Outlines the visible placement under the cursor.]]
+local function updateDeleteHover()
 	hideIndicators()
 	hideTilePreview()
-	local model = findPlacementModel(player:GetMouse().Target)
-	local ceiling = findCeilingPart(player:GetMouse().Target)
-	deleteHighlight.Adornee = model or ceiling
-	deleteHighlight.Visible = model ~= nil or ceiling ~= nil
+	local target = deleteRaycast()
+	local model = findPlacementModel(target)
+	local ceiling = findCeilingPart(target)
+	setDeleteHighlights(if model or ceiling then { model or ceiling } else {})
 end
 
 -- The player's own plot is found via the Owner attribute set by Plot:Assign.
@@ -329,30 +389,36 @@ end
 
 --[[Returns the cursor cell on the exact plane where the active mode places. Ceilings
 target the top of the selected wall segment; every other object targets its base.]]
-local function cellUnderCursor(grid: Grid.Grid, floor: number?, ceiling: boolean?): (number?, number?, Vector3?)
+local function cellUnderCursor(grid: Grid.Grid, floor: number?, ceiling: boolean?, exactY: number?): (number?, number?, Vector3?)
 	local targetFloor = floor or currentFloor
-	local targetY = if ceiling == true or (ceiling == nil and ceilingMode)
+	local placementY = if ceiling == true or (ceiling == nil and ceilingMode)
 		then grid.Origin.Y + SharedBuildingService:GetLevelTopOffset(targetFloor)
 		else floorBaseY(grid, targetFloor)
-	positionBuildPlane(grid, targetY)
+	local targetY = exactY or placementY
+	positionBuildPlane(grid, placementY)
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
 	params.FilterDescendantsInstances = { buildPlane }
 	local ray = player:GetMouse().UnitRay
-	local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
+	local result = if exactY then nil else Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
 	local position = if result then result.Position else nil
+	local activeDrag = dragState or deleteDragState
+	if exactY and math.abs(ray.Direction.Y) > 0.0001 then
+		local distance = (exactY - ray.Origin.Y) / ray.Direction.Y
+		position = if distance > 0 then ray.Origin + ray.Direction * distance else nil
+	end
 	-- Once a drag has started, keep its endpoint clamped to the plot even when the
 	-- cursor ray moves beyond the finite build plane.
-	if not position and dragState and math.abs(ray.Direction.Y) > 0.0001 then
+	if not position and activeDrag and math.abs(ray.Direction.Y) > 0.0001 then
 		local distance = (targetY - ray.Origin.Y) / ray.Direction.Y
 		if distance > 0 then
 			position = ray.Origin + ray.Direction * distance
 		end
 	end
-	if not position and dragState then
-		local last = grid:GetCellCenter(dragState.LastX, dragState.LastZ)
-		return dragState.LastX, dragState.LastZ, Vector3.new(last.X, targetY, last.Z)
+	if not position and activeDrag then
+		local last = grid:GetCellCenter(activeDrag.LastX, activeDrag.LastZ)
+		return activeDrag.LastX, activeDrag.LastZ, Vector3.new(last.X, targetY, last.Z)
 	end
 	if not position then
 		return nil, nil, nil
@@ -466,6 +532,164 @@ local function dragPlacements(state: DragState, endX: number, endZ: number): { P
 		})
 	end
 	return requests
+end
+
+local function deleteEndpointMoved(state: DeleteDragState, x: number, z: number): boolean
+	if state.DragMode == "Line" then
+		return if state.Rotation % 2 == 0 then x ~= state.StartX else z ~= state.StartZ
+	end
+	return x ~= state.StartX or z ~= state.StartZ
+end
+
+-- Selects compatible draggable placements whose occupancy intersects the same shape
+-- placement dragging would produce from the starting item.
+local function deleteSelection(state: DeleteDragState, endX: number, endZ: number): { Model }
+	if state.MovedAway and not deleteEndpointMoved(state, endX, endZ) then
+		return {}
+	end
+	local name = state.Name
+	if not name then
+		return {}
+	end
+	local base = getMyPlotBase()
+	local built = base and base.Parent and base.Parent:FindFirstChild("Built")
+	if not built then
+		return {}
+	end
+	local placementState: DragState = {
+		Mode = "Item",
+		StartX = state.StartX,
+		StartZ = state.StartZ,
+		LastX = endX,
+		LastZ = endZ,
+		Floor = state.Floor,
+		Rotation = state.Rotation,
+		Name = name,
+		Material = nil,
+	}
+	local selectedKeys = {}
+	for _, request in dragPlacements(placementState, endX, endZ) do
+		local cells, edges = SharedBuildingService:ResolveOccupancy(
+			name,
+			request.X,
+			request.Z,
+			request.Floor,
+			request.Rotation
+		)
+		for _, key in cells do selectedKeys[key] = true end
+		for _, key in edges do selectedKeys[key] = true end
+	end
+
+	local models = {}
+	for _, model in built:GetChildren() do
+		local name = model:GetAttribute("AssetName")
+		local entry = type(name) == "string" and SharedBuildingService:GetEntry(name)
+		if not entry or entry.Type ~= state.ItemType or entry.Draggable ~= state.DragMode then
+			continue
+		end
+		local cells, edges = SharedBuildingService:ResolveOccupancy(
+			name,
+			model:GetAttribute("GridX"),
+			model:GetAttribute("GridZ"),
+			model:GetAttribute("Floor"),
+			model:GetAttribute("Rotation")
+		)
+		local selected = false
+		for _, key in cells do selected = selected or selectedKeys[key] == true end
+		for _, key in edges do selected = selected or selectedKeys[key] == true end
+		if selected then
+			table.insert(models, model)
+		end
+	end
+	return models
+end
+
+local function deleteCells(state: DeleteDragState, endX: number, endZ: number): { CellRequest }
+	if state.MovedAway and not deleteEndpointMoved(state, endX, endZ) then
+		return {}
+	end
+	return rectangleCells(state.StartX, state.StartZ, endX, endZ)
+end
+
+local function existingDeleteCells(state: DeleteDragState, cells: { CellRequest }): { CellRequest }
+	local base = getMyPlotBase()
+	local plot = base and base.Parent
+	local container = plot and plot:FindFirstChild(if state.Kind == "Ceiling" then "Ceilings" else "Floor")
+	if not base or not container then
+		return {}
+	end
+	local grid = Grid.new(base)
+	local existing = {}
+	for _, cell in cells do
+		if state.Kind == "Ceiling" then
+			if container:FindFirstChild(Grid.ceilingKey(cell.X, cell.Z, state.Floor)) then
+				table.insert(existing, cell)
+			end
+			continue
+		end
+		local centre = grid:GetCellCenter(cell.X, cell.Z)
+		for _, part in container:GetChildren() do
+			if part:IsA("BasePart") and part:GetAttribute("FloorLevel") == state.Floor then
+				local localPoint = part.CFrame:PointToObjectSpace(centre)
+				if math.abs(localPoint.X) <= part.Size.X / 2 and math.abs(localPoint.Z) <= part.Size.Z / 2 then
+					table.insert(existing, cell)
+					break
+				end
+			end
+		end
+	end
+	return existing
+end
+
+local function updateDeleteCells(grid: Grid.Grid, state: DeleteDragState, cells: { CellRequest })
+	hideDeleteHighlight()
+	local ceiling = state.Kind == "Ceiling"
+	local y = grid.Origin.Y
+		+ (if ceiling then SharedBuildingService:GetLevelTopOffset(state.Floor) else SharedBuildingService:GetLevelBaseOffset(state.Floor))
+	for index, cell in cells do
+		local centre = grid:GetCellCenter(cell.X, cell.Z)
+		local indicator = getIndicator(index)
+		indicator.Size = Vector3.new(
+			Building.CELL_SIZE,
+			if ceiling then Building.CEILING_THICKNESS else 0.1,
+			Building.CELL_SIZE
+		)
+		indicator.CFrame = CFrame.new(centre.X, y - (if ceiling then Building.CEILING_THICKNESS / 2 else -0.05), centre.Z)
+		local outline = indicator:FindFirstChild("Outline") :: SelectionBox
+		outline.Visible = true
+		indicator.Parent = indicatorFolder
+	end
+	for index = #cells + 1, #indicators do
+		indicators[index].Parent = nil
+	end
+end
+
+local function updateDeleteHighlight()
+	local state = deleteDragState
+	if not state then
+		updateDeleteHover()
+		return
+	end
+	hideTilePreview()
+	local base = getMyPlotBase()
+	if not base then
+		hideDeleteHighlight()
+		hideIndicators()
+		return
+	end
+	local grid = Grid.new(base)
+	local x, z = cellUnderCursor(grid, state.Floor, state.Kind == "Ceiling", state.PlaneY)
+	if x ~= nil and z ~= nil then
+		state.LastX, state.LastZ = x, z
+		state.MovedAway = state.MovedAway or deleteEndpointMoved(state, x, z)
+	end
+	if state.Kind == "Placement" then
+		hideIndicators()
+		setDeleteHighlights(deleteSelection(state, state.LastX, state.LastZ))
+	else
+		local cells = existingDeleteCells(state, deleteCells(state, state.LastX, state.LastZ))
+		updateDeleteCells(grid, state, cells)
+	end
 end
 
 local function createGhost(name: string): Model?
@@ -716,7 +940,7 @@ local function onClick()
 	-- Delete mode prioritises rendered placements/ceilings under the cursor. Clicking a
 	-- painted elevated surface removes its supporting ceiling; level 1 paint reverts.
 	if deleteMode then
-		local target = player:GetMouse().Target
+		local target, hitPosition = deleteRaycast()
 		local model = findPlacementModel(target)
 		if model then
 			local ok = ClientBuildingService:RequestRemove(model:GetAttribute("PlacementId") :: number)
@@ -735,13 +959,13 @@ local function onClick()
 		end
 
 		local base = getMyPlotBase()
-		if not (base and player:GetMouse().Target) then
+		if not (base and target and hitPosition) then
 			refreshStatus("nothing to delete")
 			return
 		end
 		-- Delete targets the physical thing under the cursor, so use the raw mouse hit.
 		local grid = Grid.new(base)
-		local rawX, rawZ = grid:WorldToCell(player:GetMouse().Hit.Position)
+		local rawX, rawZ = grid:WorldToCell(hitPosition)
 		local x, z = math.clamp(rawX, 0, grid.Width - 1), math.clamp(rawZ, 0, grid.Depth - 1)
 		local floorLevel = target:GetAttribute("FloorLevel")
 		local level = if typeof(floorLevel) == "number" then floorLevel else currentFloor
@@ -782,6 +1006,114 @@ local function onClick()
 		local rotation = resolvePlacementRotation(grid, selectedAsset :: string, x, z, hitPosition :: Vector3)
 		local ok, reason = ClientBuildingService:RequestPlace(selectedAsset :: string, x, z, currentFloor, rotation)
 		refreshStatus(if ok then `placed ({x},{z})` else `rejected: {reason}`)
+	end
+end
+
+-- Draggable catalog items use their placement drag geometry for deletion. Everything
+-- else retains immediate click deletion.
+local function beginDeleteDrag(): boolean
+	local target, hitPosition = deleteRaycast()
+	if not target or not hitPosition then
+		return false
+	end
+	local model = findPlacementModel(target)
+	if model then
+		local name = model:GetAttribute("AssetName")
+		local entry = type(name) == "string" and SharedBuildingService:GetEntry(name)
+		if not entry or not entry.Draggable then
+			return false
+		end
+		deleteDragState = {
+			Kind = "Placement",
+			StartX = model:GetAttribute("GridX"),
+			StartZ = model:GetAttribute("GridZ"),
+			LastX = model:GetAttribute("GridX"),
+			LastZ = model:GetAttribute("GridZ"),
+			Floor = model:GetAttribute("Floor"),
+			PlaneY = hitPosition.Y,
+			Rotation = model:GetAttribute("Rotation"),
+			Name = name,
+			ItemType = entry.Type,
+			DragMode = entry.Draggable,
+			MovedAway = false,
+		}
+		return true
+	end
+
+	local ceiling = findCeilingPart(target)
+	local base = getMyPlotBase()
+	local floor = target:GetAttribute("FloorLevel")
+	if not ceiling and (typeof(floor) ~= "number" or not base) then
+		return false
+	end
+	local grid = base and Grid.new(base)
+	local x, z
+	if ceiling then
+		x, z, floor = ceiling:GetAttribute("GridX"), ceiling:GetAttribute("GridZ"), ceiling:GetAttribute("Floor")
+	else
+		local rawX, rawZ = grid:WorldToCell(hitPosition)
+		x, z = math.clamp(rawX, 0, grid.Width - 1), math.clamp(rawZ, 0, grid.Depth - 1)
+	end
+	deleteDragState = {
+		Kind = if ceiling then "Ceiling" else "Floor",
+		StartX = x,
+		StartZ = z,
+		LastX = x,
+		LastZ = z,
+		Floor = floor,
+		PlaneY = hitPosition.Y,
+		Rotation = 0,
+		Name = nil,
+		ItemType = nil,
+		DragMode = "Area",
+		MovedAway = false,
+	}
+	return true
+end
+
+local function finishDeleteDrag()
+	local state = deleteDragState
+	if not state then
+		return
+	end
+	local base = getMyPlotBase()
+	if base then
+		local grid = Grid.new(base)
+		local x, z = cellUnderCursor(grid, state.Floor, state.Kind == "Ceiling", state.PlaneY)
+		if x ~= nil and z ~= nil then
+			state.LastX, state.LastZ = x, z
+			state.MovedAway = state.MovedAway or deleteEndpointMoved(state, x, z)
+		end
+	end
+	deleteDragState = nil
+	hideDeleteHighlight()
+	hideIndicators()
+	if state.Kind == "Placement" then
+		local models = deleteSelection(state, state.LastX, state.LastZ)
+		if #models == 0 then
+			refreshStatus("delete cancelled")
+			return
+		end
+		local placementIds = {}
+		for _, model in models do
+			table.insert(placementIds, model:GetAttribute("PlacementId"))
+		end
+		local removed = removeRemote:InvokeServer(placementIds)
+		refreshStatus(if removed > 0 then `removed {removed}/{#placementIds}` else "remove failed")
+		return
+	end
+
+	local cells = existingDeleteCells(state, deleteCells(state, state.LastX, state.LastZ))
+	if #cells == 0 then
+		refreshStatus("delete cancelled")
+		return
+	end
+	if state.Kind == "Ceiling" then
+		local removed = ceilingRemote:InvokeServer("remove", cells, state.Floor)
+		refreshStatus(if removed > 0 then `removed {removed}/{#cells} ceilings` else "remove failed")
+	else
+		local removed, reason = paintRemote:InvokeServer(cells, state.Floor, 1)
+		refreshStatus(if removed > 0 then `reverted {removed}/{#cells}` else `rejected: {reason}`)
 	end
 end
 
@@ -871,6 +1203,7 @@ local function setBuildMode(enabled: boolean)
 		rebuildPreview()
 	else
 		dragState = nil
+		deleteDragState = nil
 		freeCameraMode = false
 		cameraController:SetEnabled(false)
 		if previewModel then
@@ -1102,8 +1435,10 @@ RunService.RenderStepped:Connect(function()
 		end
 	end
 	if deleteMode then
-		-- Hide the build plane so the cursor ray hits real objects to delete.
-		hideBuildPlane()
+		-- Hover targets real objects; an active drag keeps one stable grid plane.
+		if not deleteDragState then
+			hideBuildPlane()
+		end
 		updateDeleteHighlight()
 	else
 		hideDeleteHighlight()
@@ -1120,7 +1455,11 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	elseif input.KeyCode == Enum.KeyCode.R then
 		rotateSelection()
 	elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-		if deleteMode or not beginDrag() then
+		if deleteMode then
+			if not beginDeleteDrag() then
+				onClick()
+			end
+		elseif not beginDrag() then
 			onClick()
 		end
 	end
@@ -1128,7 +1467,11 @@ end)
 
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		finishDrag()
+		if deleteDragState then
+			finishDeleteDrag()
+		else
+			finishDrag()
+		end
 	end
 end)
 

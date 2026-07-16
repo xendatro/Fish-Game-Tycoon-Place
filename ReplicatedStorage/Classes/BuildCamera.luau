@@ -18,7 +18,6 @@ local INPUT_PRIORITY = Enum.ContextActionPriority.High.Value + 100
 
 type PartState = {
 	Transparency: number,
-	CanQuery: boolean,
 }
 
 local BuildCamera = {}
@@ -39,6 +38,7 @@ function BuildCamera.new()
 	self._ceilingSelected = false
 	self._visibilityDirty = false
 	self._partStates = {}
+	self._hiddenParts = {}
 
 	self._inputBegan = UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if self._enabled and not gameProcessed and input.UserInputType == Enum.UserInputType.MouseButton2 then
@@ -105,12 +105,11 @@ function BuildCamera:_SetPartVisible(part: BasePart, visible: boolean)
 	if not state then
 		state = {
 			Transparency = part.LocalTransparencyModifier,
-			CanQuery = part.CanQuery,
 		}
 		self._partStates[part] = state
 	end
 	part.LocalTransparencyModifier = if visible then state.Transparency else 1
-	part.CanQuery = if visible then state.CanQuery else false
+	self._hiddenParts[part] = if visible then nil else true
 end
 
 function BuildCamera:_SetTreeVisible(instance: Instance, visible: boolean)
@@ -163,10 +162,20 @@ function BuildCamera:_RestoreVisibility()
 	for part, state in self._partStates do
 		if part.Parent then
 			part.LocalTransparencyModifier = state.Transparency
-			part.CanQuery = state.CanQuery
 		end
 	end
 	table.clear(self._partStates)
+	table.clear(self._hiddenParts)
+end
+
+function BuildCamera:GetHiddenParts(): { BasePart }
+	local parts = {}
+	for part in self._hiddenParts do
+		if part.Parent then
+			table.insert(parts, part)
+		end
+	end
+	return parts
 end
 
 function BuildCamera:_Update(deltaTime: number)
