@@ -48,7 +48,7 @@ function ClientBuildingService:RequestRemove(placementId: number): boolean
 	return removeRemote:InvokeServer({ placementId }) > 0
 end
 
---[[Requests painting a cell's floor material. Returns success + reason.]]
+--[[Requests painting a cell's floor material. Material 0 removes an overlay.]]
 function ClientBuildingService:RequestPaint(x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
 	local count, reason = paintRemote:InvokeServer({ { X = x, Z = z } }, floor, materialIndex)
 	return count > 0, reason
@@ -80,7 +80,7 @@ local buildMode = true
 local freeCameraMode = false
 local deleteMode = false
 local paintMode = false
-local paintMaterial = 2 -- floor material index while painting (1 = grass/revert)
+local paintMaterial = 2 -- floor material index while painting (1 = grass)
 local ceilingMode = false
 local ceilingMaterial = 1 -- ceiling material index while placing ceilings
 local statusLabel: TextLabel
@@ -395,7 +395,11 @@ local function cellUnderCursor(grid: Grid.Grid, floor: number?, ceiling: boolean
 		then grid.Origin.Y + SharedBuildingService:GetLevelTopOffset(targetFloor)
 		else floorBaseY(grid, targetFloor)
 	local targetY = exactY or placementY
-	positionBuildPlane(grid, placementY)
+	if deleteDragState and not Building.SHOW_GRID_DURING_DELETE_DRAG then
+		hideBuildPlane()
+	else
+		positionBuildPlane(grid, placementY)
+	end
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
@@ -611,6 +615,28 @@ local function deleteCells(state: DeleteDragState, endX: number, endZ: number): 
 	return rectangleCells(state.StartX, state.StartZ, endX, endZ)
 end
 
+-- Rendered floor rectangles may cover many cells after greedy meshing.
+local function floorPartAt(container: Instance?, grid: Grid.Grid, x: number, z: number, floor: number): BasePart?
+	if not container then
+		return nil
+	end
+	local centre = grid:GetCellCenter(x, z)
+	for _, part in container:GetChildren() do
+		if part:IsA("BasePart") and part:GetAttribute("FloorLevel") == floor then
+			local localPoint = part.CFrame:PointToObjectSpace(centre)
+			if math.abs(localPoint.X) <= part.Size.X / 2 and math.abs(localPoint.Z) <= part.Size.Z / 2 then
+				return part
+			end
+		end
+	end
+	return nil
+end
+
+local function renderedFloorMaterial(container: Instance?, grid: Grid.Grid, x: number, z: number, floor: number): number?
+	local part = floorPartAt(container, grid, x, z, floor)
+	return if part then part:GetAttribute("MaterialIndex") :: number else if floor == 1 then 1 else nil
+end
+
 local function existingDeleteCells(state: DeleteDragState, cells: { CellRequest }): { CellRequest }
 	local base = getMyPlotBase()
 	local plot = base and base.Parent
@@ -627,15 +653,8 @@ local function existingDeleteCells(state: DeleteDragState, cells: { CellRequest 
 			end
 			continue
 		end
-		local centre = grid:GetCellCenter(cell.X, cell.Z)
-		for _, part in container:GetChildren() do
-			if part:IsA("BasePart") and part:GetAttribute("FloorLevel") == state.Floor then
-				local localPoint = part.CFrame:PointToObjectSpace(centre)
-				if math.abs(localPoint.X) <= part.Size.X / 2 and math.abs(localPoint.Z) <= part.Size.Z / 2 then
-					table.insert(existing, cell)
-					break
-				end
-			end
+		if floorPartAt(container, grid, cell.X, cell.Z, state.Floor) then
+			table.insert(existing, cell)
 		end
 	end
 	return existing
@@ -654,7 +673,11 @@ local function updateDeleteCells(grid: Grid.Grid, state: DeleteDragState, cells:
 			if ceiling then Building.CEILING_THICKNESS else 0.1,
 			Building.CELL_SIZE
 		)
-		indicator.CFrame = CFrame.new(centre.X, y - (if ceiling then Building.CEILING_THICKNESS / 2 else -0.05), centre.Z)
+		indicator.CFrame = CFrame.new(
+			centre.X,
+			y + (if ceiling then -Building.CEILING_THICKNESS / 2 else Building.FLOOR_THICKNESS + 0.05),
+			centre.Z
+		)
 		local outline = indicator:FindFirstChild("Outline") :: SelectionBox
 		outline.Visible = true
 		indicator.Parent = indicatorFolder
@@ -834,18 +857,24 @@ local function updateTilePreview()
 
 	if paintMode then
 		local topOffset = SharedBuildingService:GetLevelBaseOffset(targetFloor)
-		for index, cell in cells do
+		local floorContainer = base.Parent:FindFirstChild("Floor")
+		local previewCount = 0
+		for _, cell in cells do
+			if renderedFloorMaterial(floorContainer, grid, cell.X, cell.Z, targetFloor) == paintMaterial then
+				continue
+			end
+			previewCount += 1
 			local centre = grid:GetCellCenter(cell.X, cell.Z)
 			local valid = SharedBuildingService:CanPaintFloor(grid, cell.X, cell.Z, targetFloor)
 			setTilePreview(
-				index,
-				CFrame.new(centre.X, grid.Origin.Y + topOffset + 0.05, centre.Z),
+				previewCount,
+				CFrame.new(centre.X, grid.Origin.Y + topOffset + Building.FLOOR_THICKNESS + 0.05, centre.Z),
 				Vector3.new(Building.CELL_SIZE, 0.1, Building.CELL_SIZE),
 				valid,
 				false
 			)
 		end
-		for index = #cells + 1, #tilePreviews do
+		for index = previewCount + 1, #tilePreviews do
 			tilePreviews[index].Parent = nil
 		end
 		return
@@ -937,8 +966,8 @@ local function onClick()
 	if not buildMode then
 		return
 	end
-	-- Delete mode prioritises rendered placements/ceilings under the cursor. Clicking a
-	-- painted elevated surface removes its supporting ceiling; level 1 paint reverts.
+	-- Delete mode prioritises rendered placements/ceilings under the cursor. A rendered
+	-- floor overlay is removed independently from its supporting ceiling.
 	if deleteMode then
 		local target, hitPosition = deleteRaycast()
 		local model = findPlacementModel(target)
@@ -969,13 +998,8 @@ local function onClick()
 		local x, z = math.clamp(rawX, 0, grid.Width - 1), math.clamp(rawZ, 0, grid.Depth - 1)
 		local floorLevel = target:GetAttribute("FloorLevel")
 		local level = if typeof(floorLevel) == "number" then floorLevel else currentFloor
-		if level > 1 then
-			local ok = ClientBuildingService:RequestRemoveCeiling(x, z, level - 1)
-			refreshStatus(if ok then `removed ceiling ({x},{z})` else "no ceiling here")
-		else
-			local ok = ClientBuildingService:RequestPaint(x, z, 1, 1) -- 1 = grass/revert
-			refreshStatus(if ok then `reverted ({x},{z})` else "nothing to delete")
-		end
+		local ok = ClientBuildingService:RequestPaint(x, z, level, 0)
+		refreshStatus(if ok then `removed floor ({x},{z})` else "nothing to delete")
 		return
 	end
 
@@ -1112,8 +1136,8 @@ local function finishDeleteDrag()
 		local removed = ceilingRemote:InvokeServer("remove", cells, state.Floor)
 		refreshStatus(if removed > 0 then `removed {removed}/{#cells} ceilings` else "remove failed")
 	else
-		local removed, reason = paintRemote:InvokeServer(cells, state.Floor, 1)
-		refreshStatus(if removed > 0 then `reverted {removed}/{#cells}` else `rejected: {reason}`)
+		local removed, reason = paintRemote:InvokeServer(cells, state.Floor, 0)
+		refreshStatus(if removed > 0 then `removed {removed}/{#cells} floors` else `rejected: {reason}`)
 	end
 end
 
@@ -1435,7 +1459,7 @@ RunService.RenderStepped:Connect(function()
 		end
 	end
 	if deleteMode then
-		-- Hover targets real objects; an active drag keeps one stable grid plane.
+		-- Hover targets real objects; an active drag can optionally show one stable grid plane.
 		if not deleteDragState then
 			hideBuildPlane()
 		end

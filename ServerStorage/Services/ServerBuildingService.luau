@@ -142,22 +142,22 @@ end
 
 --[[
 Returns a painted floor cell's tile descriptor for meshing - its material index and the
-world Y of its top surface - or nil if the cell has no tile. Grass (material 1) renders
-nothing (base/ceiling shows through). Elevated tiles sit on the ceiling one level below.
+world Y of its supporting surface - or nil if the cell has no explicit tile. Elevated
+grass is an explicit tile; base-floor grass remains the plot's implicit default.
 ]]
-local function floorTileAt(grid, x: number, z: number, floor: number): ({ Material: number, TopY: number }?)
-	local material = grid:GetFloorMaterial(x, z, floor)
-	if material <= 1 then
+local function floorTileAt(grid, x: number, z: number, floor: number): ({ Material: number, SurfaceY: number }?)
+	local entry = grid:GetFloorEntry(x, z, floor)
+	if not entry then
 		return nil
 	end
 	if floor == 1 then
-		return { Material = material, TopY = grid.Origin.Y }
+		return { Material = entry.Material, SurfaceY = grid.Origin.Y }
 	end
 	local ceiling = grid:GetCeiling(x, z, floor - 1)
 	if not ceiling then
 		return nil
 	end
-	return { Material = material, TopY = grid.Origin.Y + SharedBuildingService:GetLevelBaseOffset(floor) }
+	return { Material = entry.Material, SurfaceY = grid.Origin.Y + SharedBuildingService:GetLevelBaseOffset(floor) }
 end
 
 --[[
@@ -198,7 +198,7 @@ local function remeshFloor(plot, floor: number)
 					return false
 				end
 				local other = floorTileAt(grid, cx, cz, floor)
-				return other ~= nil and other.Material == tile.Material and other.TopY == tile.TopY
+				return other ~= nil and other.Material == tile.Material and other.SurfaceY == tile.SurfaceY
 			end
 
 			local w = 1
@@ -228,15 +228,16 @@ local function remeshFloor(plot, floor: number)
 			local part = Instance.new("Part")
 			part.Anchored = true
 			part.CanCollide = false
-			part.Size = Vector3.new(w * cell, 0.2, h * cell)
+			part.Size = Vector3.new(w * cell, Building.FLOOR_THICKNESS, h * cell)
 			part.Material = (Enum.Material :: any)[Materials.Floor[tile.Material]]
-			-- Sit a hair above the surface to avoid z-fighting.
+			-- The overlay's bottom rests directly on its supporting surface.
 			part.CFrame = CFrame.new(
 				grid.Origin.X + (x + w / 2) * cell,
-				tile.TopY + 0.1,
+				tile.SurfaceY + Building.FLOOR_THICKNESS / 2,
 				grid.Origin.Z + (z + h / 2) * cell
 			)
 			part:SetAttribute("FloorLevel", floor)
+			part:SetAttribute("MaterialIndex", tile.Material)
 			part.Parent = container
 		end
 	end
@@ -371,7 +372,7 @@ function ServerBuildingService:Remove(player: Player, placementIds: { number }):
 	return removed
 end
 
---[[Paints every valid request and remeshes once. A click sends one request.]]
+--[[Paints every changed, valid request and remeshes once. A click sends one request.]]
 function ServerBuildingService:PaintFloor(
 	player: Player,
 	requests: { CellRequest },
@@ -385,7 +386,7 @@ function ServerBuildingService:PaintFloor(
 	if floor < 1 or floor % 1 ~= 0 then
 		return 0, "invalid floor"
 	end
-	if materialIndex < 1 or materialIndex > #Materials.Floor then
+	if materialIndex < 0 or materialIndex > #Materials.Floor then
 		return 0, "invalid material"
 	end
 	local grid = plot:GetGrid()
@@ -397,7 +398,12 @@ function ServerBuildingService:PaintFloor(
 	local seen = {}
 	for _, request in requests do
 		local key = `{request.X},{request.Z}`
-		local valid = not seen[key] and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor)
+		local entry = grid:GetFloorEntry(request.X, request.Z, floor)
+		local unchanged = if entry then entry.Material == materialIndex else floor == 1 and materialIndex == 1
+		local valid = not seen[key] and grid:IsInBounds(request.X, request.Z)
+			and (if materialIndex == 0
+				then entry ~= nil
+				else not unchanged and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor))
 		seen[key] = true
 		if valid then
 			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex)
@@ -408,7 +414,7 @@ function ServerBuildingService:PaintFloor(
 		remeshFloor(plot, floor)
 		persist(plot)
 	end
-	return painted, if painted > 0 then nil else "no valid floor cells"
+	return painted, if painted > 0 then nil else "no changed floor cells"
 end
 
 --[[Places supported requests. Shared propagation handles both clicks and area drags.]]
@@ -460,7 +466,7 @@ function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellReq
 	for _, request in requests do
 		local key = `{request.X},{request.Z}`
 		if not seen[key] and grid:RemoveCeiling(request.X, request.Z, floor) then
-			grid:SetFloorMaterial(request.X, request.Z, floor + 1, 1)
+			grid:SetFloorMaterial(request.X, request.Z, floor + 1, 0)
 			derenderCeiling(plot, request.X, request.Z, floor)
 			removed += 1
 		end

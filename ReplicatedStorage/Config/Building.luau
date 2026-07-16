@@ -21,6 +21,11 @@ Building.WALL_HEIGHT = 8
 -- (which becomes the next build floor's surface); its thickness hangs below that line.
 Building.CEILING_THICKNESS = 1
 
+-- Painted floor overlays sit on the plot or a ceiling. Delete-drag grid visibility is
+-- temporary UX tuning and can be switched back on without changing input logic.
+Building.FLOOR_THICKNESS = 0.2
+Building.SHOW_GRID_DURING_DELETE_DRAG = false
+
 -- Temporary computer controls for the orbiting build camera.
 Building.Camera = {
 	PanSpeed = 32,

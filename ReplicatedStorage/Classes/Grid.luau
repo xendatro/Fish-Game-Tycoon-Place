@@ -37,7 +37,7 @@ export type Placement = {
 -- The compact per-placement tuple actually written to the save (see Compress).
 export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot}
 -- Painted floor material (index into Config.Materials.Floor), per floor + cell. Grass
--- (index 1) is the default and never stored.
+-- is implicit on the plot base but stored when explicitly painted on an upper floor.
 export type FloorEntry = { Floor: number, X: number, Z: number, Material: number }
 -- A ceiling capping one build floor at a cell. TopOffset is its top surface's height
 -- above Origin.Y; each ceiling can become the surface for the next build level.
@@ -177,21 +177,20 @@ end
 
 -- ===== Floor material layer =================================================
 
---[[Sets a cell's painted floor material on a floor. Material 1 (grass) is the default,
-so setting it clears the entry (sparse storage - grass costs nothing).]]
+--[[Sets a cell's painted floor material. Material 0 removes the overlay; base-floor
+grass remains implicit, while upper-floor grass must be stored so it can render.]]
 function Grid:SetFloorMaterial(x: number, z: number, floor: number, material: number)
 	local key = Grid.cellKey(x, z, floor)
-	if material <= 1 then
+	if material < 1 or (floor == 1 and material == 1) then
 		self._floors[key] = nil
 	else
 		self._floors[key] = { Floor = floor, X = x, Z = z, Material = material }
 	end
 end
 
---[[Returns a cell's floor material index, defaulting to 1 (grass) when unpainted.]]
-function Grid:GetFloorMaterial(x: number, z: number, floor: number): number
-	local entry = self._floors[Grid.cellKey(x, z, floor)]
-	return if entry then entry.Material else 1
+--[[Returns the explicitly stored floor entry, or nil.]]
+function Grid:GetFloorEntry(x: number, z: number, floor: number): FloorEntry?
+	return self._floors[Grid.cellKey(x, z, floor)]
 end
 
 -- ===== Ceiling layer ========================================================
@@ -303,7 +302,7 @@ Compresses the grid to the save blob. Strategy:
     references a small integer instead of repeating a string.
   * Each placement becomes a flat integer tuple {paletteIndex, x, z, floor, rot}.
   * Derived occupancy (Cells/Edges) is NOT saved - Decompress rebuilds it.
-Anything left at defaults (empty cells, grass) is simply absent.
+Anything left at defaults (empty cells and base-floor grass) is simply absent.
 ]]
 function Grid:Compress(): SaveBlob
 	local palette: { string } = {}
