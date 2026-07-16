@@ -22,8 +22,6 @@ local SharedBuildingService = {}
 export type CatalogEntry = {
 	Name: string,
 	Type: "Content" | "Wall" | "Ceiling" | "Hanger",
-	Heights: { number }?, -- present on extendables (walls/stairs)
-	Extendable: boolean, -- stairs / some walls
 	-- Footprint in whole cells, derived by measuring the model.
 	Footprint: { Width: number, Depth: number },
 	Model: Model?, -- the representative placeable model (nil if not found)
@@ -32,11 +30,9 @@ export type CatalogEntry = {
 
 local catalog: { [string]: CatalogEntry } = {}
 
--- Placeable models gathered from Assets.Placeables, keyed by name then by height
--- level. Models without a Height attribute (non-extendables) are stored under
--- DEFAULT_HEIGHT_KEY. See gatherModels / GetModel.
-local DEFAULT_HEIGHT_KEY = 0
-local modelsByName: { [string]: { [number]: Model } } = {}
+-- Placeable models gathered from Assets.Placeables. Every wall is one fixed-height
+-- segment now, so each catalog name resolves to exactly one model.
+local modelsByName: { [string]: Model } = {}
 
 -- ===== Catalog ==============================================================
 
@@ -50,11 +46,9 @@ function SharedBuildingService:DeriveFootprint(model: Model): { Width: number, D
 	}
 end
 
---[[Indexes every top-level placeable model under Assets.Placeables by name and height.
+--[[Indexes every top-level placeable model under Assets.Placeables by name.
 The folder holds category folders of models, so we take Model descendants - but only
-top-level ones (a Model nested inside another Model is a sub-part, not a placeable).
-Duplicate-named models are height variants, distinguished by their numeric Height
-level attribute (1..4); models without one are stored as the default variant.]]
+top-level ones (a Model nested inside another Model is a sub-part, not a placeable).]]
 local function gatherModels()
 	local assets = ReplicatedStorage:FindFirstChild("Assets")
 	local placeables = assets and assets:FindFirstChild("Placeables")
@@ -66,40 +60,13 @@ local function gatherModels()
 	for _, descendant in placeables:GetDescendants() do
 		if descendant:IsA("Model") and not descendant:FindFirstAncestorOfClass("Model") then
 			local name = descendant.Name
-			local height = descendant:GetAttribute("Height") or DEFAULT_HEIGHT_KEY
-
-			local variants = modelsByName[name]
-			if not variants then
-				variants = {}
-				modelsByName[name] = variants
-			end
-
-			if variants[height] then
-				warn(`[SharedBuildingService]: duplicate placeable '{name}' at height {height}; keeping first`)
+			if modelsByName[name] then
+				warn(`[SharedBuildingService]: duplicate placeable '{name}'; keeping first`)
 			else
-				variants[height] = descendant
+				modelsByName[name] = descendant
 			end
 		end
 	end
-end
-
---[[Returns a representative model for an entry (used for footprint + preview): the
-default variant, else the lowest height, else any.]]
-local function representativeModel(name: string): Model?
-	local variants = modelsByName[name]
-	if not variants then
-		return nil
-	end
-	if variants[DEFAULT_HEIGHT_KEY] then
-		return variants[DEFAULT_HEIGHT_KEY]
-	end
-	for level = 1, Building.MAX_HEIGHT_LEVEL do
-		if variants[level] then
-			return variants[level]
-		end
-	end
-	local _, any = next(variants)
-	return any
 end
 
 --[[Builds the catalog by merging every module under Config/Items. Each entry gets its
@@ -123,9 +90,8 @@ local function buildCatalog()
 				continue
 			end
 			entry.Name = name
-			entry.Extendable = entry.Heights ~= nil
 
-			local model = representativeModel(name)
+			local model = modelsByName[name]
 			entry.Model = model
 			if model then
 				entry.ModelSize = model:GetExtentsSize()
@@ -145,17 +111,9 @@ function SharedBuildingService:GetEntry(name: string): CatalogEntry?
 	return catalog[name]
 end
 
---[[Returns the exact height variant when requested. A missing variant returns nil
-instead of silently rendering a model whose geometry disagrees with grid data.]]
-function SharedBuildingService:GetModel(name: string, height: number?): Model?
-	local variants = modelsByName[name]
-	if not variants then
-		return nil
-	end
-	if height then
-		return variants[height]
-	end
-	return representativeModel(name)
+--[[Returns the one model associated with a catalog entry.]]
+function SharedBuildingService:GetModel(name: string): Model?
+	return modelsByName[name]
 end
 
 --[[Returns the whole merged catalog.]]
@@ -262,8 +220,7 @@ function SharedBuildingService:ResolveOccupancy(
 	x: number,
 	z: number,
 	floor: number,
-	rotation: number,
-	_height: number?
+	rotation: number
 ): ({ string }, { string })
 	local entry = catalog[name]
 	if not entry then
@@ -341,189 +298,44 @@ local function modelExtents(model: Model): Vector3
 	return size
 end
 
---[[Returns the vertical offset of the floor supporting a placement. Floor 1 is the
-plot surface. Higher floors are ceiling tops; every footprint cell/edge must have a
-ceiling beneath it at one consistent height.]]
-function SharedBuildingService:GetFloorOffset(
-	grid: Grid.Grid,
-	name: string,
-	x: number,
-	z: number,
-	floor: number,
-	rotation: number
-): (number?, string?)
-	if floor == 1 then
-		return 0
-	end
-
-	local entry = catalog[name]
-	if not entry then
-		return nil, "unknown asset"
-	end
-
-	local supportTopOffset: number? = nil
-	local function addSupport(topOffset: number?): boolean
-		if not topOffset then
-			return false
-		end
-		if supportTopOffset and supportTopOffset ~= topOffset then
-			return false
-		end
-		supportTopOffset = topOffset
-		return true
-	end
-
-	if entry.Type == "Wall" then
-		local length = entry.Footprint.Width
-		local pi = pivotIndex(length)
-		local orientation, ex, ez = wallEdgeParams(x, z, rotation)
-		for i = 0, length - 1 do
-			local offset = i - pi
-			local first, second, belowEdgeKey
-			if orientation == "H" then
-				first = grid:GetCeiling(ex + offset, ez, floor - 1)
-				second = grid:GetCeiling(ex + offset, ez - 1, floor - 1)
-				belowEdgeKey = Grid.edgeKey("H", ex + offset, ez, floor - 1)
-			else
-				first = grid:GetCeiling(ex, ez + offset, floor - 1)
-				second = grid:GetCeiling(ex - 1, ez + offset, floor - 1)
-				belowEdgeKey = Grid.edgeKey("V", ex, ez + offset, floor - 1)
-			end
-			local ceilingTop = math.max(if first then first.TopOffset else 0, if second then second.TopOffset else 0)
-
-			-- A wall directly below on the same edge supports stacking: rest on its top.
-			local belowId = grid:GetEdgeOccupant(belowEdgeKey)
-			local belowWall = belowId and grid:GetPlacement(belowId)
-			local wallTop = (belowWall and self:GetPlacementTopOffset(grid, belowWall)) or 0
-
-			local topOffset = math.max(ceilingTop, wallTop)
-			if topOffset == 0 or not addSupport(topOffset) then
-				return nil, if topOffset == 0 then "needs floor below" else "floor is uneven"
-			end
-		end
-	else
-		for _, coord in computeCellCoords(entry, x, z, rotation) do
-			local ceiling = grid:GetCeiling(coord[1], coord[2], floor - 1)
-			if not ceiling or not addSupport(ceiling.TopOffset) then
-				return nil, if not ceiling then "needs floor below" else "floor is uneven"
-			end
-		end
-	end
-
-	return supportTopOffset
+--[[Returns the bottom and top offsets of a fixed-height build level.]]
+function SharedBuildingService:GetLevelBaseOffset(floor: number): number
+	return (floor - 1) * Building.WALL_HEIGHT
 end
 
---[[Returns a placement's TOP-surface offset above Origin.Y: its own floor offset plus its
-measured model height. Used to stack walls and to snap ceilings flush to a wall top.]]
-function SharedBuildingService:GetPlacementTopOffset(grid: Grid.Grid, placement: Grid.Placement): number?
-	local floorOffset = self:GetFloorOffset(grid, placement.Name, placement.X, placement.Z, placement.Floor, placement.Rotation)
-	local model = self:GetModel(placement.Name, placement.Height)
-	local height = model and modelExtents(model).Y
-	if floorOffset and height then
-		return floorOffset + height
+function SharedBuildingService:GetLevelTopOffset(floor: number): number
+	return floor * Building.WALL_HEIGHT
+end
+
+--[[Places a model horizontally, then shifts it vertically until its actual bounding-box
+bottom rests exactly on the selected level. This works with any authored model pivot.]]
+function SharedBuildingService:PivotModelToLevel(model: Model, placementCFrame: CFrame, originY: number, floor: number)
+	model:PivotTo(placementCFrame)
+	local boundingCFrame, boundingSize = model:GetBoundingBox()
+	local bottomY = boundingCFrame.Position.Y - boundingSize.Y / 2
+	local baseY = originY + self:GetLevelBaseOffset(floor)
+	model:PivotTo(model:GetPivot() + Vector3.new(0, baseY - bottomY, 0))
+end
+
+--[[Returns a ceiling's fixed top offset when it has a bordering wall on this level or
+an adjacent ceiling on this level. Adjacent tiles let a ceiling spread inward.]]
+function SharedBuildingService:GetCeilingTopOffset(grid: Grid.Grid, x: number, z: number, floor: number): number?
+	for _, key in {
+		Grid.edgeKey("H", x, z, floor),
+		Grid.edgeKey("H", x, z + 1, floor),
+		Grid.edgeKey("V", x, z, floor),
+		Grid.edgeKey("V", x + 1, z, floor),
+	} do
+		if grid:GetEdgeOccupant(key) then
+			return self:GetLevelTopOffset(floor)
+		end
+	end
+	for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
+		if grid:GetCeiling(x + offset[1], z + offset[2], floor) then
+			return self:GetLevelTopOffset(floor)
+		end
 	end
 	return nil
-end
-
-local shortestWallHeight: number? = nil
---[[Returns the measured height of the shortest wall model in the catalog. Used as the
-default per-floor surface height for previews (a floor N sits ~(N-1) walls up). Cached.]]
-function SharedBuildingService:GetShortestWallHeight(): number
-	if shortestWallHeight then
-		return shortestWallHeight
-	end
-	local shortest: number? = nil
-	for name, entry in catalog do
-		if entry.Type ~= "Wall" then
-			continue
-		end
-		local variants = modelsByName[name]
-		if variants then
-			for _, model in variants do
-				local h = modelExtents(model).Y
-				if not shortest or h < shortest then
-					shortest = h
-				end
-			end
-		end
-	end
-	shortestWallHeight = shortest or Building.HEIGHT_STUDS[1]
-	return shortestWallHeight
-end
-
---[[Returns the ceiling's TOP surface offset - flush with the highest bordering wall top.
-With no bordering wall, an adjacent same-floor ceiling supplies the top offset for spreading.]]
-function SharedBuildingService:GetCeilingTopOffset(grid: Grid.Grid, x: number, z: number, floor: number): number?
-	local wallTop: number? = nil
-	local function considerWall(topOffset: number?)
-		if topOffset and (not wallTop or topOffset > wallTop) then
-			wallTop = topOffset
-		end
-	end
-
-	for _, key in {
-		Grid.edgeKey("H", x, z, floor),
-		Grid.edgeKey("H", x, z + 1, floor),
-		Grid.edgeKey("V", x, z, floor),
-		Grid.edgeKey("V", x + 1, z, floor),
-	} do
-		local id = grid:GetEdgeOccupant(key)
-		local placement = id and grid:GetPlacement(id)
-		if placement then
-			-- Snap to the wall's actual (measured) top, so the ceiling top is flush with it.
-			considerWall(self:GetPlacementTopOffset(grid, placement))
-		end
-	end
-	if wallTop then
-		return wallTop
-	end
-
-	local adjacentTop: number? = nil
-	for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
-		local ceiling = grid:GetCeiling(x + offset[1], z + offset[2], floor)
-		if ceiling and (not adjacentTop or ceiling.TopOffset > adjacentTop) then
-			adjacentTop = ceiling.TopOffset
-		end
-	end
-
-	return adjacentTop
-end
-
---[[Returns every distinct ceiling top offset a cell could snap to (each bordering wall's
-top, plus adjacent same-floor ceilings), sorted ascending. When a tile borders walls of
-different heights this has multiple entries, and the client picks one from where the mouse
-is aiming; the server validates the chosen offset against this list.]]
-function SharedBuildingService:GetCeilingSupportOffsets(grid: Grid.Grid, x: number, z: number, floor: number): { number }
-	local offsets: { number } = {}
-	local seen: { [number]: boolean } = {}
-	local function add(offset: number?)
-		if offset and not seen[offset] then
-			seen[offset] = true
-			table.insert(offsets, offset)
-		end
-	end
-
-	for _, key in {
-		Grid.edgeKey("H", x, z, floor),
-		Grid.edgeKey("H", x, z + 1, floor),
-		Grid.edgeKey("V", x, z, floor),
-		Grid.edgeKey("V", x + 1, z, floor),
-	} do
-		local id = grid:GetEdgeOccupant(key)
-		local placement = id and grid:GetPlacement(id)
-		if placement then
-			add(self:GetPlacementTopOffset(grid, placement))
-		end
-	end
-	for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
-		local ceiling = grid:GetCeiling(x + offset[1], z + offset[2], floor)
-		if ceiling then
-			add(ceiling.TopOffset)
-		end
-	end
-
-	table.sort(offsets)
-	return offsets
 end
 
 -- One grid-unit of an object's hitbox, sized to the model, for validity display + queries.
@@ -533,8 +345,8 @@ export type HitboxPiece = { CFrame: CFrame, Size: Vector3, InBounds: boolean, Ke
 
 --[[
 Returns the hitbox pieces for a placement: one per occupied cell for content, one per
-edge segment for walls. Each is sized to the placement's actual height-variant model
-(height = model height; walls use the model's thin dimension as thickness), carries the
+edge segment for walls. Each is sized to the placement's model (walls use the model's
+thin dimension as thickness), carries the
 occupancy Key it maps to, and flags whether it's inside the plot.
 ]]
 function SharedBuildingService:GetHitboxPieces(
@@ -543,9 +355,7 @@ function SharedBuildingService:GetHitboxPieces(
 	x: number,
 	z: number,
 	floor: number,
-	rotation: number,
-	height: number?,
-	previewFloorOffset: number?
+	rotation: number
 ): { HitboxPiece }
 	local entry = catalog[name]
 	if not entry then
@@ -553,11 +363,11 @@ function SharedBuildingService:GetHitboxPieces(
 	end
 
 	local cell = Building.CELL_SIZE
-	local model = self:GetModel(name, height)
+	local model = self:GetModel(name)
 	local modelSize = if model then modelExtents(model) else (entry.ModelSize or Vector3.new(cell, cell, cell))
 	local h = modelSize.Y
 	local origin = grid.Origin
-	local floorOffset = self:GetFloorOffset(grid, name, x, z, floor, rotation) or previewFloorOffset or 0
+	local floorOffset = self:GetLevelBaseOffset(floor)
 	local yaw = math.rad(-90 * rotation)
 	local pieces: { HitboxPiece } = {}
 
@@ -617,25 +427,17 @@ function SharedBuildingService:CanPlace(
 	x: number,
 	z: number,
 	floor: number,
-	rotation: number,
-	height: number?
+	rotation: number
 ): (boolean, string?)
 	local entry = catalog[name]
 	if not entry then
 		return false, "unknown asset"
 	end
 
-	if floor < 1 or floor > Building.FLOOR_COUNT then
+	if floor < 1 or floor % 1 ~= 0 then
 		return false, "invalid floor"
 	end
-
-	if entry.Extendable and (not height or not table.find(entry.Heights :: { number }, height)) then
-		return false, "invalid height level"
-	end
-	if entry.Extendable and not self:GetModel(name, height) then
-		return false, "missing height model"
-	end
-	local cells, edges = self:ResolveOccupancy(name, x, z, floor, rotation, height)
+	local cells, edges = self:ResolveOccupancy(name, x, z, floor, rotation)
 
 	-- Bounds: every cell of the (rotated) footprint must be inside the plot.
 	for _, coord in computeCellCoords(entry, x, z, rotation) do
@@ -644,9 +446,34 @@ function SharedBuildingService:CanPlace(
 		end
 	end
 	if floor > 1 then
-		local _, reason = self:GetFloorOffset(grid, name, x, z, floor, rotation)
-		if reason then
-			return false, reason
+		if entry.Type == "Wall" then
+			local length = entry.Footprint.Width
+			local pi = pivotIndex(length)
+			local orientation, ex, ez = wallEdgeParams(x, z, rotation)
+			for i = 0, length - 1 do
+				local offset = i - pi
+				local belowKey
+				local firstCeiling
+				local secondCeiling
+				if orientation == "H" then
+					belowKey = Grid.edgeKey("H", ex + offset, ez, floor - 1)
+					firstCeiling = grid:GetCeiling(ex + offset, ez, floor - 1)
+					secondCeiling = grid:GetCeiling(ex + offset, ez - 1, floor - 1)
+				else
+					belowKey = Grid.edgeKey("V", ex, ez + offset, floor - 1)
+					firstCeiling = grid:GetCeiling(ex, ez + offset, floor - 1)
+					secondCeiling = grid:GetCeiling(ex - 1, ez + offset, floor - 1)
+				end
+				if not grid:GetEdgeOccupant(belowKey) and not firstCeiling and not secondCeiling then
+					return false, "needs support below"
+				end
+			end
+		else
+			for _, coord in computeCellCoords(entry, x, z, rotation) do
+				if not grid:GetCeiling(coord[1], coord[2], floor - 1) then
+					return false, "needs ceiling below"
+				end
+			end
 		end
 	end
 

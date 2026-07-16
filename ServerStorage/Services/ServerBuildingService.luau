@@ -56,12 +56,11 @@ end
 Renders a committed placement on the server (so it replicates to everyone). Clones the
 asset model, rotates it, and rests it on the plot's floor surface at its pivot cell.
 
-This is the basic content path. TODO: floor-2 vertical offset from the supporting
-structure's height, and routing ceilings + base flooring through the greedy-mesher
-rather than a per-cell clone.
+This is the basic content path. Each level has a deterministic configured offset;
+ceilings and flooring use their own render paths below.
 ]]
 local function render(plot, placement)
-	local model = SharedBuildingService:GetModel(placement.Name, placement.Height)
+	local model = SharedBuildingService:GetModel(placement.Name)
 	if not model then
 		return
 	end
@@ -75,25 +74,12 @@ local function render(plot, placement)
 	clone:SetAttribute("GridZ", placement.Z)
 	clone:SetAttribute("Floor", placement.Floor)
 	clone:SetAttribute("Rotation", placement.Rotation)
-	if placement.Height then
-		clone:SetAttribute("Height", placement.Height)
-	end
 
-	-- Footprint-centred CFrame on the plot surface; raise it to the selected floor and
-	-- by half its height (assumes the pivot is at the bounding-box centre).
+	-- First place it on the correct X/Z edge or cell, then bottom-align its actual bounds
+	-- to the level surface. Model pivots are not required to be centred.
 	local groundCF = SharedBuildingService:GetPlacementCFrame(grid, placement.Name, placement.X, placement.Z, placement.Rotation)
 	if groundCF then
-		local _, size = clone:GetBoundingBox()
-		local floorOffset = SharedBuildingService:GetFloorOffset(
-			grid,
-			placement.Name,
-			placement.X,
-			placement.Z,
-			placement.Floor,
-			placement.Rotation
-		) or 0
-		local yOffset = floorOffset + size.Y / 2
-		clone:PivotTo(groundCF + Vector3.new(0, yOffset, 0))
+		SharedBuildingService:PivotModelToLevel(clone, groundCF, grid.Origin.Y, placement.Floor)
 	end
 
 	clone.Parent = getBuildContainer(plot)
@@ -122,8 +108,7 @@ end
 --[[
 Returns a painted floor cell's tile descriptor for meshing - its material index and the
 world Y of its top surface - or nil if the cell has no tile. Grass (material 1) renders
-nothing (base/ceiling shows through). Floor 2 tiles sit on the ceiling top, so cells at
-different ceiling heights won't merge.
+nothing (base/ceiling shows through). Elevated tiles sit on the ceiling one level below.
 ]]
 local function floorTileAt(grid, x: number, z: number, floor: number): ({ Material: number, TopY: number }?)
 	local material = grid:GetFloorMaterial(x, z, floor)
@@ -133,11 +118,11 @@ local function floorTileAt(grid, x: number, z: number, floor: number): ({ Materi
 	if floor == 1 then
 		return { Material = material, TopY = grid.Origin.Y }
 	end
-	local ceiling = grid:GetCeiling(x, z, 1)
+	local ceiling = grid:GetCeiling(x, z, floor - 1)
 	if not ceiling then
 		return nil
 	end
-	return { Material = material, TopY = grid.Origin.Y + ceiling.TopOffset }
+	return { Material = material, TopY = grid.Origin.Y + SharedBuildingService:GetLevelBaseOffset(floor) }
 end
 
 --[[
@@ -277,8 +262,7 @@ function ServerBuildingService:Place(
 	x: number,
 	z: number,
 	floor: number,
-	rotation: number,
-	height: number?
+	rotation: number
 ): (number?, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
@@ -287,21 +271,20 @@ function ServerBuildingService:Place(
 
 	local grid = plot:GetGrid()
 
-	local ok, reason = SharedBuildingService:CanPlace(grid, name, x, z, floor, rotation, height)
+	local ok, reason = SharedBuildingService:CanPlace(grid, name, x, z, floor, rotation)
 	if not ok then
 		return nil, reason
 	end
 
 	-- TODO: verify the player can afford this asset and deduct the cost here, before commit.
 
-	local cells, edges = SharedBuildingService:ResolveOccupancy(name, x, z, floor, rotation, height)
+	local cells, edges = SharedBuildingService:ResolveOccupancy(name, x, z, floor, rotation)
 	local id = grid:AddPlacement({
 		Name = name,
 		X = x,
 		Z = z,
 		Floor = floor,
 		Rotation = rotation,
-		Height = height,
 		Cells = cells,
 		Edges = edges,
 	})
@@ -334,15 +317,15 @@ function ServerBuildingService:Remove(player: Player, placementId: number): bool
 end
 
 --[[
-Paints a cell's floor material on the given floor. Floor 1 always works (grass reverts).
-Floor 2 requires a ceiling at that cell to paint on. Returns success + reason.
+Paints a cell's floor material on the given level. Level 1 always works (grass reverts).
+Higher levels require a ceiling directly below. Returns success + reason.
 ]]
 function ServerBuildingService:PaintFloor(player: Player, x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
 		return false, "no plot"
 	end
-	if floor < 1 or floor > Building.FLOOR_COUNT then
+	if floor < 1 or floor % 1 ~= 0 then
 		return false, "invalid floor"
 	end
 	if materialIndex < 1 or materialIndex > #Materials.Floor then
@@ -353,7 +336,7 @@ function ServerBuildingService:PaintFloor(player: Player, x: number, z: number, 
 	if not grid:IsInBounds(x, z) then
 		return false, "out of bounds"
 	end
-	if floor == 2 and not grid:GetCeiling(x, z, 1) then
+	if floor > 1 and not grid:GetCeiling(x, z, floor - 1) then
 		return false, "no ceiling here"
 	end
 
@@ -364,17 +347,15 @@ function ServerBuildingService:PaintFloor(player: Player, x: number, z: number, 
 end
 
 --[[
-Places a ceiling at a cell. Requires support (a bordering wall or adjacent ceiling) and
-snaps to the highest world-space support top on the selected floor. Floor 1 ceilings
-become floor 2; floor 2 ceilings are roof-only. Returns success + reason.
+Places a ceiling at the top of the selected fixed-height wall segment. A bordering wall or
+adjacent ceiling on the same level supplies support. Returns success + reason.
 ]]
 function ServerBuildingService:PlaceCeiling(
 	player: Player,
 	x: number,
 	z: number,
 	floor: number,
-	materialIndex: number,
-	desiredTopOffset: number?
+	materialIndex: number
 ): (boolean, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
@@ -383,7 +364,7 @@ function ServerBuildingService:PlaceCeiling(
 	if materialIndex < 1 or materialIndex > #Materials.Ceiling then
 		return false, "invalid material"
 	end
-	if floor < 1 or floor > Building.FLOOR_COUNT then
+	if floor < 1 or floor % 1 ~= 0 then
 		return false, "invalid floor"
 	end
 
@@ -395,14 +376,7 @@ function ServerBuildingService:PlaceCeiling(
 		return false, "ceiling already here"
 	end
 
-	-- Honour the client's mouse-chosen height if it's a real support option; else snap to
-	-- the highest.
-	local topOffset
-	if desiredTopOffset and table.find(SharedBuildingService:GetCeilingSupportOffsets(grid, x, z, floor), desiredTopOffset) then
-		topOffset = desiredTopOffset
-	else
-		topOffset = SharedBuildingService:GetCeilingTopOffset(grid, x, z, floor)
-	end
+	local topOffset = SharedBuildingService:GetCeilingTopOffset(grid, x, z, floor)
 	if not topOffset then
 		return false, "needs a wall or ceiling"
 	end
@@ -414,8 +388,7 @@ function ServerBuildingService:PlaceCeiling(
 end
 
 --[[
-Removes a ceiling. Removing a floor 1 ceiling also clears its floor-2 paint tile;
-removing a floor 2 roof does not affect a buildable floor. Returns success.
+Removes a ceiling and clears the painted tile that rested on it one level above.
 ]]
 function ServerBuildingService:RemoveCeiling(player: Player, x: number, z: number, floor: number): boolean
 	local plot = ServerPlotService:GetPlayerPlot(player)
@@ -428,10 +401,8 @@ function ServerBuildingService:RemoveCeiling(player: Player, x: number, z: numbe
 		return false
 	end
 
-	if floor == 1 then
-		grid:SetFloorMaterial(x, z, 2, 1) -- clear the floor-2 tile that sat on top
-		remeshFloor(plot, 2)
-	end
+	grid:SetFloorMaterial(x, z, floor + 1, 1)
+	remeshFloor(plot, floor + 1)
 	derenderCeiling(plot, x, z, floor)
 	persist(plot)
 	return true
@@ -444,14 +415,11 @@ local function isFiniteNumber(value: any): boolean
 	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
 
-placeRemote.OnServerInvoke = function(player, name, x, z, floor, rotation, height)
+placeRemote.OnServerInvoke = function(player, name, x, z, floor, rotation)
 	if type(name) ~= "string" or not (isFiniteNumber(x) and isFiniteNumber(z) and isFiniteNumber(floor) and isFiniteNumber(rotation)) then
 		return nil, "bad request"
 	end
-	if height ~= nil and not isFiniteNumber(height) then
-		return nil, "bad request"
-	end
-	return ServerBuildingService:Place(player, name, x, z, floor, rotation, height)
+	return ServerBuildingService:Place(player, name, x, z, floor, rotation)
 end
 
 removeRemote.OnServerInvoke = function(player, placementId)
@@ -468,7 +436,7 @@ paintRemote.OnServerInvoke = function(player, x, z, floor, materialIndex)
 	return ServerBuildingService:PaintFloor(player, x, z, floor, materialIndex)
 end
 
-ceilingRemote.OnServerInvoke = function(player, action, x, z, floor, materialIndex, desiredTopOffset)
+ceilingRemote.OnServerInvoke = function(player, action, x, z, floor, materialIndex)
 	if not (isFiniteNumber(x) and isFiniteNumber(z) and isFiniteNumber(floor)) then
 		return false
 	end
@@ -476,10 +444,7 @@ ceilingRemote.OnServerInvoke = function(player, action, x, z, floor, materialInd
 		if not isFiniteNumber(materialIndex) then
 			return false
 		end
-		if desiredTopOffset ~= nil and not isFiniteNumber(desiredTopOffset) then
-			return false
-		end
-		return ServerBuildingService:PlaceCeiling(player, x, z, floor, materialIndex, desiredTopOffset)
+		return ServerBuildingService:PlaceCeiling(player, x, z, floor, materialIndex)
 	elseif action == "remove" then
 		return ServerBuildingService:RemoveCeiling(player, x, z, floor)
 	end

@@ -28,20 +28,19 @@ export type Placement = {
 	Name: string, -- catalog entry name
 	X: number,
 	Z: number,
-	Floor: number, -- 1..FLOOR_COUNT
+	Floor: number, -- unbounded 1-based build level
 	Rotation: number, -- 0..3
-	Height: number?, -- height level 1..MAX_HEIGHT_LEVEL for extendables, nil otherwise
 	Cells: { string }, -- occupied cell keys (empty for pure-wall placements)
 	Edges: { string }, -- occupied edge keys (empty for non-wall placements)
 }
 
 -- The compact per-placement tuple actually written to the save (see Compress).
-export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot, height?}
+export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot}
 -- Painted floor material (index into Config.Materials.Floor), per floor + cell. Grass
 -- (index 1) is the default and never stored.
 export type FloorEntry = { Floor: number, X: number, Z: number, Material: number }
 -- A ceiling capping one build floor at a cell. TopOffset is its top surface's height
--- above Origin.Y; floor 2 ceilings are roofs and do not create a third build floor.
+-- above Origin.Y; each ceiling can become the surface for the next build level.
 export type CeilingEntry = { Floor: number, X: number, Z: number, TopOffset: number, Material: number }
 
 export type SaveBlob = {
@@ -114,9 +113,8 @@ end
 
 -- ===== World-space helpers ==================================================
 
---[[Returns the world-space CENTER of a cell at the given floor's base height.
-Note: this returns the cell floor position; vertical placement (height levels,
-ceiling offset) is applied by the render layer, not here.]]
+--[[Returns the world-space center of a cell on the plot base. The render layer adds
+the selected build level's fixed vertical offset.]]
 function Grid:GetCellCenter(x: number, z: number): Vector3
 	local cell = Building.CELL_SIZE
 	return self.Origin + Vector3.new((x + 0.5) * cell, 0, (z + 0.5) * cell)
@@ -242,7 +240,6 @@ function Grid:AddPlacement(data: {
 	Z: number,
 	Floor: number,
 	Rotation: number,
-	Height: number?,
 	Cells: { string },
 	Edges: { string },
 }): number
@@ -256,7 +253,6 @@ function Grid:AddPlacement(data: {
 		Z = data.Z,
 		Floor = data.Floor,
 		Rotation = data.Rotation,
-		Height = data.Height,
 		Cells = data.Cells,
 		Edges = data.Edges,
 	}
@@ -305,7 +301,7 @@ end
 Compresses the grid to the save blob. Strategy:
   * A per-plot Palette dedupes the catalog names actually used, so each placement
     references a small integer instead of repeating a string.
-  * Each placement becomes a flat integer tuple {paletteIndex, x, z, floor, rot, height?}.
+  * Each placement becomes a flat integer tuple {paletteIndex, x, z, floor, rot}.
   * Derived occupancy (Cells/Edges) is NOT saved - Decompress rebuilds it.
 Anything left at defaults (empty cells, grass) is simply absent.
 ]]
@@ -323,9 +319,6 @@ function Grid:Compress(): SaveBlob
 		end
 
 		local tuple: SavedPlacement = { index, placement.X, placement.Z, placement.Floor, placement.Rotation }
-		if placement.Height then
-			tuple[6] = placement.Height
-		end
 		table.insert(placements, tuple)
 	end
 
@@ -346,13 +339,13 @@ end
 Rebuilds a Grid from a save blob.
 
 `basePart` sizes the grid. `resolveFootprint` is supplied by the caller (it wraps
-the catalog) and, given a placement's name/coords/rotation/height, returns the
+the catalog) and, given a placement's name/coords/rotation, returns the
 occupied cell keys and edge keys. This keeps the Grid decoupled from the catalog.
 ]]
 function Grid.Decompress(
 	blob: SaveBlob,
 	basePart: BasePart,
-	resolveFootprint: (name: string, x: number, z: number, floor: number, rotation: number, height: number?) -> ({ string }, { string })
+	resolveFootprint: (name: string, x: number, z: number, floor: number, rotation: number) -> ({ string }, { string })
 ): Grid
 	local self = Grid.new(basePart)
 	if not blob then
@@ -365,15 +358,14 @@ function Grid.Decompress(
 			warn(`[Grid]: save referenced palette index {tuple[1]} with no entry; skipped`)
 			continue
 		end
-		local x, z, floor, rotation, height = tuple[2], tuple[3], tuple[4], tuple[5], tuple[6]
-		local cells, edges = resolveFootprint(name, x, z, floor, rotation, height)
+		local x, z, floor, rotation = tuple[2], tuple[3], tuple[4], tuple[5]
+		local cells, edges = resolveFootprint(name, x, z, floor, rotation)
 		self:AddPlacement({
 			Name = name,
 			X = x,
 			Z = z,
 			Floor = floor,
 			Rotation = rotation,
-			Height = height,
 			Cells = cells,
 			Edges = edges,
 		})
@@ -385,10 +377,10 @@ function Grid.Decompress(
 
 	for _, tuple in blob.Ceilings or {} do
 		if #tuple >= 5 then
-			self:SetCeiling(tuple[2], tuple[3], tuple[1], tuple[4], tuple[5])
+			self:SetCeiling(tuple[2], tuple[3], tuple[1], tuple[1] * Building.WALL_HEIGHT, tuple[5])
 		else
 			-- Legacy ceiling tuple: {x, z, heightLevel, materialIndex}.
-			self:SetCeiling(tuple[1], tuple[2], 1, Building.HEIGHT_STUDS[tuple[3]], tuple[4])
+			self:SetCeiling(tuple[1], tuple[2], 1, Building.WALL_HEIGHT, tuple[4])
 		end
 	end
 
