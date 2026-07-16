@@ -17,5 +17,6 @@ return {
 	
 	TestWall = {
 		Type = "Wall",
+		Draggable = "Line",
 	}
 }

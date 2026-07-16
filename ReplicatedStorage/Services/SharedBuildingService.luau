@@ -22,6 +22,8 @@ local SharedBuildingService = {}
 export type CatalogEntry = {
 	Name: string,
 	Type: "Content" | "Wall" | "Ceiling" | "Hanger",
+	-- Line follows the item's authored length; Area fills an X/Z footprint lattice.
+	Draggable: ("Line" | "Area")?,
 	-- Footprint in whole cells, derived by measuring the model.
 	Footprint: { Width: number, Depth: number },
 	Model: Model?, -- the representative placeable model (nil if not found)
@@ -307,6 +309,17 @@ function SharedBuildingService:GetLevelTopOffset(floor: number): number
 	return floor * Building.WALL_HEIGHT
 end
 
+function SharedBuildingService:CanPaintFloor(grid: Grid.Grid, x: number, z: number, floor: number): (boolean, string?)
+	if floor < 1 or floor % 1 ~= 0 then
+		return false, "invalid floor"
+	elseif not grid:IsInBounds(x, z) then
+		return false, "out of bounds"
+	elseif floor > 1 and not grid:GetCeiling(x, z, floor - 1) then
+		return false, "no ceiling here"
+	end
+	return true
+end
+
 --[[Places a model horizontally, then shifts it vertically until its actual bounding-box
 bottom rests exactly on the selected level. This works with any authored model pivot.]]
 function SharedBuildingService:PivotModelToLevel(model: Model, placementCFrame: CFrame, originY: number, floor: number)
@@ -336,6 +349,40 @@ function SharedBuildingService:GetCeilingTopOffset(grid: Grid.Grid, x: number, z
 		end
 	end
 	return nil
+end
+
+--[[Adds every supported member of a ceiling selection to the supplied grid. Repeated
+passes let support spread from any wall/existing ceiling through connected cells. The
+client calls this on its throwaway mirror; the server calls it on the real grid.]]
+function SharedBuildingService:FillCeilings(
+	grid: Grid.Grid,
+	cells: { { X: number, Z: number } },
+	floor: number,
+	material: number
+): { { Index: number, X: number, Z: number, TopOffset: number } }
+	local pending, placed, seen = {}, {}, {}
+	for index, cell in cells do
+		local key = `{cell.X},{cell.Z}`
+		if not seen[key] and grid:IsInBounds(cell.X, cell.Z) and not grid:GetCeiling(cell.X, cell.Z, floor) then
+			table.insert(pending, { Index = index, X = cell.X, Z = cell.Z })
+		end
+		seen[key] = true
+	end
+	local progressed = true
+	while progressed do
+		progressed = false
+		for index = #pending, 1, -1 do
+			local cell = pending[index]
+			local topOffset = self:GetCeilingTopOffset(grid, cell.X, cell.Z, floor)
+			if topOffset then
+				grid:SetCeiling(cell.X, cell.Z, floor, topOffset, material)
+				table.insert(placed, { Index = cell.Index, X = cell.X, Z = cell.Z, TopOffset = topOffset })
+				table.remove(pending, index)
+				progressed = true
+			end
+		end
+	end
+	return placed
 end
 
 -- One grid-unit of an object's hitbox, sized to the model, for validity display + queries.
@@ -432,6 +479,9 @@ function SharedBuildingService:CanPlace(
 	local entry = catalog[name]
 	if not entry then
 		return false, "unknown asset"
+	end
+	if x % 1 ~= 0 or z % 1 ~= 0 or rotation % 1 ~= 0 or rotation < 0 or rotation >= Building.ROTATION_STEPS then
+		return false, "invalid grid position"
 	end
 
 	if floor < 1 or floor % 1 ~= 0 then

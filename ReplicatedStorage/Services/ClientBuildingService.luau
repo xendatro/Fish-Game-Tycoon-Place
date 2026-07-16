@@ -34,6 +34,9 @@ local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
 
 local player = Players.LocalPlayer
 
+type PlacementRequest = { X: number, Z: number, Floor: number, Rotation: number }
+type CellRequest = { X: number, Z: number }
+
 --[[Requests a placement. Returns the server's (placementId?, reason?) so the caller
 can confirm or roll back its preview. Assumes the caller already previewed with
 SharedBuildingService:CanPlace so this normally matches what the server accepts.]]
@@ -84,8 +87,22 @@ local BuildModeButton: TextButton?
 local CameraModeButton: TextButton?
 local cameraController = BuildCamera.new()
 
+type DragState = {
+	Mode: "Item" | "Paint" | "Ceiling",
+	StartX: number,
+	StartZ: number,
+	LastX: number,
+	LastZ: number,
+	Floor: number,
+	Rotation: number,
+	Name: string?,
+	Material: number?,
+}
+local dragState: DragState? = nil
+
 --[[Clears every non-place mode. Callers then set the one they want.]]
 local function clearModes()
+	dragState = nil
 	deleteMode = false
 	paintMode = false
 	ceilingMode = false
@@ -93,6 +110,7 @@ end
 
 -- Live preview ("ghost") of the selected asset, following the cursor.
 local previewModel: Model? = nil
+local extraPreviewModels: { Model } = {}
 
 -- Per-piece hitboxes (pooled). The parts are invisible; each carries a SelectionBox
 -- outline that shows red only on the pieces that actually collide / are out of bounds.
@@ -141,24 +159,36 @@ deleteHighlight.SurfaceTransparency = 0.85
 deleteHighlight.Visible = false
 deleteHighlight.Parent = indicatorFolder
 
--- Cell preview shared by floor painting and ceiling placement.
-local tilePreview = Instance.new("Part")
-tilePreview.Name = "BuildingTilePreview"
-tilePreview.Anchored = true
-tilePreview.CanCollide = false
-tilePreview.CanQuery = false
-tilePreview.CastShadow = false
-tilePreview.Transparency = 1
+-- Pooled per-cell previews shared by floor painting and ceiling placement.
+local tilePreviews: { BasePart } = {}
 
-local tileOutline = Instance.new("SelectionBox")
-tileOutline.Name = "Outline"
-tileOutline.Adornee = tilePreview
-tileOutline.LineThickness = 0.05
-tileOutline.SurfaceTransparency = 0.75
-tileOutline.Parent = tilePreview
+local function getTilePreview(index: number): BasePart
+	local part = tilePreviews[index]
+	if part then
+		return part
+	end
+	part = Instance.new("Part")
+	part.Name = "BuildingTilePreview"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Transparency = 1
+
+	local outline = Instance.new("SelectionBox")
+	outline.Name = "Outline"
+	outline.Adornee = part
+	outline.LineThickness = 0.05
+	outline.SurfaceTransparency = 0.75
+	outline.Parent = part
+	tilePreviews[index] = part
+	return part
+end
 
 local function hideTilePreview()
-	tilePreview.Parent = nil
+	for _, part in tilePreviews do
+		part.Parent = nil
+	end
 end
 
 --[[Walks up from an instance to the placement Model carrying a PlacementId attribute.]]
@@ -298,10 +328,11 @@ end
 
 --[[Returns the cursor cell on the exact plane where the active mode places. Ceilings
 target the top of the selected wall segment; every other object targets its base.]]
-local function cellUnderCursor(grid: Grid.Grid): (number?, number?, Vector3?)
-	local targetY = if ceilingMode
-		then grid.Origin.Y + SharedBuildingService:GetLevelTopOffset(currentFloor)
-		else floorBaseY(grid, currentFloor)
+local function cellUnderCursor(grid: Grid.Grid, floor: number?, ceiling: boolean?): (number?, number?, Vector3?)
+	local targetFloor = floor or currentFloor
+	local targetY = if ceiling == true or (ceiling == nil and ceilingMode)
+		then grid.Origin.Y + SharedBuildingService:GetLevelTopOffset(targetFloor)
+		else floorBaseY(grid, targetFloor)
 	positionBuildPlane(grid, targetY)
 
 	local params = RaycastParams.new()
@@ -309,12 +340,25 @@ local function cellUnderCursor(grid: Grid.Grid): (number?, number?, Vector3?)
 	params.FilterDescendantsInstances = { buildPlane }
 	local ray = player:GetMouse().UnitRay
 	local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
-	if not result then
+	local position = if result then result.Position else nil
+	-- Once a drag has started, keep its endpoint clamped to the plot even when the
+	-- cursor ray moves beyond the finite build plane.
+	if not position and dragState and math.abs(ray.Direction.Y) > 0.0001 then
+		local distance = (targetY - ray.Origin.Y) / ray.Direction.Y
+		if distance > 0 then
+			position = ray.Origin + ray.Direction * distance
+		end
+	end
+	if not position and dragState then
+		local last = grid:GetCellCenter(dragState.LastX, dragState.LastZ)
+		return dragState.LastX, dragState.LastZ, Vector3.new(last.X, targetY, last.Z)
+	end
+	if not position then
 		return nil, nil, nil
 	end
 
-	local x, z = grid:WorldToCell(result.Position)
-	return math.clamp(x, 0, grid.Width - 1), math.clamp(z, 0, grid.Depth - 1), result.Position
+	local x, z = grid:WorldToCell(position)
+	return math.clamp(x, 0, grid.Width - 1), math.clamp(z, 0, grid.Depth - 1), position
 end
 
 --[[For walls, rotation chooses the horizontal/vertical axis while the cursor chooses
@@ -367,24 +411,67 @@ local function rotateSelection()
 	refreshStatus()
 end
 
---[[Rebuilds the preview ghost from the current selection. Destroys any old one.
-The ghost is a non-collidable, non-queryable, semi-transparent clone so it doesn't block
-the placement raycast.]]
-local function rebuildPreview()
-	if previewModel then
-		previewModel:Destroy()
-		previewModel = nil
+local function rectangleCells(startX: number, startZ: number, endX: number, endZ: number): { CellRequest }
+	local cells = {}
+	local stepX = if endX >= startX then 1 else -1
+	local stepZ = if endZ >= startZ then 1 else -1
+	for z = startZ, endZ, stepZ do
+		for x = startX, endX, stepX do
+			table.insert(cells, { X = x, Z = z })
+		end
+	end
+	return cells
+end
+
+local function dragPlacements(state: DragState, endX: number, endZ: number): { PlacementRequest }
+	local entry = state.Name and SharedBuildingService:GetEntry(state.Name)
+	if not entry then
+		return {}
+	end
+	if entry.Draggable == "Area" then
+		local spanX = if state.Rotation % 2 == 0 then entry.Footprint.Width else entry.Footprint.Depth
+		local spanZ = if state.Rotation % 2 == 0 then entry.Footprint.Depth else entry.Footprint.Width
+		local deltaX, deltaZ = endX - state.StartX, endZ - state.StartZ
+		local directionX = if deltaX < 0 then -1 else 1
+		local directionZ = if deltaZ < 0 then -1 else 1
+		local countX = math.floor(math.abs(deltaX) / spanX) + 1
+		local countZ = math.floor(math.abs(deltaZ) / spanZ) + 1
+		local requests = {}
+		for zIndex = 0, countZ - 1 do
+			for xIndex = 0, countX - 1 do
+				table.insert(requests, {
+					X = state.StartX + xIndex * spanX * directionX,
+					Z = state.StartZ + zIndex * spanZ * directionZ,
+					Floor = state.Floor,
+					Rotation = state.Rotation,
+				})
+			end
+		end
+		return requests
 	end
 
-	if not buildMode or deleteMode or paintMode or ceilingMode or not selectedAsset then
-		return
+	local horizontal = state.Rotation % 2 == 0
+	local delta = if horizontal then endX - state.StartX else endZ - state.StartZ
+	local direction = if delta < 0 then -1 else 1
+	local step = entry.Footprint.Width
+	local count = math.floor(math.abs(delta) / step) + 1
+	local requests = {}
+	for index = 0, count - 1 do
+		table.insert(requests, {
+			X = state.StartX + (if horizontal then index * step * direction else 0),
+			Z = state.StartZ + (if horizontal then 0 else index * step * direction),
+			Floor = state.Floor,
+			Rotation = state.Rotation,
+		})
 	end
+	return requests
+end
 
-	local model = SharedBuildingService:GetModel(selectedAsset)
+local function createGhost(name: string): Model?
+	local model = SharedBuildingService:GetModel(name)
 	if not model then
-		return
+		return nil
 	end
-
 	local ghost = model:Clone()
 	for _, part in ghost:GetDescendants() do
 		if part:IsA("BasePart") then
@@ -395,43 +482,105 @@ local function rebuildPreview()
 		end
 	end
 	ghost.Parent = Workspace
-	previewModel = ghost
+	return ghost
+end
+
+local function hideExtraPreviews()
+	for _, model in extraPreviewModels do
+		model:PivotTo(CFrame.new(0, -1000, 0))
+	end
+end
+
+local function getPlacementPreview(index: number, name: string): Model?
+	if index == 1 then
+		return previewModel
+	end
+	local model = extraPreviewModels[index - 1]
+	if not model then
+		model = createGhost(name)
+		if model then
+			extraPreviewModels[index - 1] = model
+		end
+	end
+	return model
+end
+
+--[[Rebuilds the preview ghost from the current selection. Destroys any old one.
+The ghost is a non-collidable, non-queryable, semi-transparent clone so it doesn't block
+the placement raycast.]]
+local function rebuildPreview()
+	if previewModel then
+		previewModel:Destroy()
+		previewModel = nil
+	end
+	for _, model in extraPreviewModels do
+		model:Destroy()
+	end
+	table.clear(extraPreviewModels)
+
+	if not buildMode or deleteMode or paintMode or ceilingMode or not selectedAsset then
+		return
+	end
+
+	previewModel = createGhost(selectedAsset)
 end
 
 --[[Positions an invisible hitbox over each footprint piece (sized to the model) and shows
 its red outline only when that piece is out of bounds or its occupancy key is already
 taken in the mirror grid - the exact same check that blocks placement server-side.]]
-local function updateIndicators(grid: Grid.Grid, x: number, z: number, rotation: number)
-	local pieces = SharedBuildingService:GetHitboxPieces(grid, selectedAsset, x, z, currentFloor, rotation)
-	local canPlace = SharedBuildingService:CanPlace(grid, selectedAsset, x, z, currentFloor, rotation)
-
-	for i, piece in pieces do
-		local indicator = getIndicator(i)
-		indicator.Size = piece.Size
-		indicator.CFrame = piece.CFrame
-
-		local colliding = not canPlace or not piece.InBounds or grid:IsOccupied(piece.Key)
-
-		local outline = indicator:FindFirstChild("Outline") :: SelectionBox
-		outline.Visible = colliding
-		indicator.Parent = indicatorFolder
+local function updateIndicators(grid: Grid.Grid, name: string, requests: { PlacementRequest })
+	local indicatorIndex = 0
+	for _, request in requests do
+		local pieces = SharedBuildingService:GetHitboxPieces(
+			grid,
+			name,
+			request.X,
+			request.Z,
+			request.Floor,
+			request.Rotation
+		)
+		local canPlace = SharedBuildingService:CanPlace(
+			grid,
+			name,
+			request.X,
+			request.Z,
+			request.Floor,
+			request.Rotation
+		)
+		for _, piece in pieces do
+			indicatorIndex += 1
+			local indicator = getIndicator(indicatorIndex)
+			indicator.Size = piece.Size
+			indicator.CFrame = piece.CFrame
+			local outline = indicator:FindFirstChild("Outline") :: SelectionBox
+			outline.Visible = not canPlace or not piece.InBounds or grid:IsOccupied(piece.Key)
+			indicator.Parent = indicatorFolder
+		end
 	end
-
-	-- Hide any pooled indicators beyond this footprint's size.
-	for i = #pieces + 1, #indicators do
+	for i = indicatorIndex + 1, #indicators do
 		indicators[i].Parent = nil
 	end
 end
 
-local function setTilePreview(cframe: CFrame, size: Vector3, valid: boolean, filled: boolean)
+local function setTilePreview(index: number, cframe: CFrame, size: Vector3, valid: boolean, filled: boolean)
 	local color = if valid then Color3.fromRGB(65, 210, 105) else Color3.fromRGB(220, 60, 60)
-	tilePreview.Size = size
-	tilePreview.CFrame = cframe
-	tilePreview.Color = color
-	tilePreview.Transparency = if filled then 0.65 else 1
-	tileOutline.Color3 = color
-	tileOutline.SurfaceColor3 = color
-	tilePreview.Parent = indicatorFolder
+	local part = getTilePreview(index)
+	local outline = part:FindFirstChild("Outline") :: SelectionBox
+	part.Size = size
+	part.CFrame = cframe
+	part.Color = color
+	part.Transparency = if filled then 0.65 else 1
+	outline.Color3 = color
+	outline.SurfaceColor3 = color
+	part.Parent = indicatorFolder
+end
+
+local function ceilingValidity(grid: Grid.Grid, cells: { CellRequest }, floor: number): { [number]: boolean }
+	local valid = {}
+	for _, result in SharedBuildingService:FillCeilings(grid, cells, floor, ceilingMaterial) do
+		valid[result.Index] = true
+	end
+	return valid
 end
 
 --[[Shows the target cell for paint and ceiling modes. Paint uses a thin outline on
@@ -445,34 +594,53 @@ local function updateTilePreview()
 	end
 
 	local grid = buildMirrorGrid(base)
-	local x, z = cellUnderCursor(grid)
+	local targetFloor = if dragState then dragState.Floor else currentFloor
+	local x, z = cellUnderCursor(grid, targetFloor, ceilingMode)
 	if x == nil or z == nil then
 		hideTilePreview()
 		return
 	end
-	local centre = grid:GetCellCenter(x, z)
+	if dragState then
+		dragState.LastX, dragState.LastZ = x, z
+	end
+	local cells = if dragState
+		then rectangleCells(dragState.StartX, dragState.StartZ, x, z)
+		else { { X = x, Z = z } }
 
 	if paintMode then
-		local topOffset = SharedBuildingService:GetLevelBaseOffset(currentFloor)
-		local valid = currentFloor == 1 or grid:GetCeiling(x, z, currentFloor - 1) ~= nil
-		setTilePreview(
-			CFrame.new(centre.X, grid.Origin.Y + topOffset + 0.05, centre.Z),
-			Vector3.new(Building.CELL_SIZE, 0.1, Building.CELL_SIZE),
-			valid,
-			false
-		)
+		local topOffset = SharedBuildingService:GetLevelBaseOffset(targetFloor)
+		for index, cell in cells do
+			local centre = grid:GetCellCenter(cell.X, cell.Z)
+			local valid = SharedBuildingService:CanPaintFloor(grid, cell.X, cell.Z, targetFloor)
+			setTilePreview(
+				index,
+				CFrame.new(centre.X, grid.Origin.Y + topOffset + 0.05, centre.Z),
+				Vector3.new(Building.CELL_SIZE, 0.1, Building.CELL_SIZE),
+				valid,
+				false
+			)
+		end
+		for index = #cells + 1, #tilePreviews do
+			tilePreviews[index].Parent = nil
+		end
 		return
 	end
 
-	local topOffset = SharedBuildingService:GetLevelTopOffset(currentFloor)
-	local supported = SharedBuildingService:GetCeilingTopOffset(grid, x, z, currentFloor) ~= nil
-	local valid = supported and grid:GetCeiling(x, z, currentFloor) == nil
-	setTilePreview(
-		CFrame.new(centre.X, grid.Origin.Y + topOffset - Building.CEILING_THICKNESS / 2, centre.Z),
-		Vector3.new(Building.CELL_SIZE, Building.CEILING_THICKNESS, Building.CELL_SIZE),
-		valid,
-		true
-	)
+	local topOffset = SharedBuildingService:GetLevelTopOffset(targetFloor)
+	local validity = ceilingValidity(grid, cells, targetFloor)
+	for index, cell in cells do
+		local centre = grid:GetCellCenter(cell.X, cell.Z)
+		setTilePreview(
+			index,
+			CFrame.new(centre.X, grid.Origin.Y + topOffset - Building.CEILING_THICKNESS / 2, centre.Z),
+			Vector3.new(Building.CELL_SIZE, Building.CEILING_THICKNESS, Building.CELL_SIZE),
+			validity[index] == true,
+			true
+		)
+	end
+	for index = #cells + 1, #tilePreviews do
+		tilePreviews[index].Parent = nil
+	end
 end
 
 --[[Snaps the preview ghost + validity indicators to the cell under the cursor
@@ -494,22 +662,48 @@ local function updatePreview()
 	local base = getMyPlotBase()
 	if base then
 		local grid = buildMirrorGrid(base)
-		local x, z, hitPosition = cellUnderCursor(grid)
+		local targetFloor = if dragState then dragState.Floor else currentFloor
+		local x, z, hitPosition = cellUnderCursor(grid, targetFloor, false)
 		if x == nil or z == nil or hitPosition == nil then
 			previewModel:PivotTo(CFrame.new(0, -1000, 0))
+			hideExtraPreviews()
 			hideIndicators()
 			return
 		end
-		local rotation = resolvePlacementRotation(grid, selectedAsset, x, z, hitPosition)
-		local groundCF = SharedBuildingService:GetPlacementCFrame(grid, selectedAsset, x, z, rotation)
-		if groundCF then
-			SharedBuildingService:PivotModelToLevel(previewModel, groundCF, grid.Origin.Y, currentFloor)
-			updateIndicators(grid, x, z, rotation)
-			return
+		local name = if dragState and dragState.Name then dragState.Name else selectedAsset
+		local requests
+		if dragState and dragState.Mode == "Item" then
+			dragState.LastX, dragState.LastZ = x, z
+			requests = dragPlacements(dragState, x, z)
+		else
+			local rotation = resolvePlacementRotation(grid, name, x, z, hitPosition)
+			requests = { { X = x, Z = z, Floor = targetFloor, Rotation = rotation } }
 		end
+		for index, request in requests do
+			local model = getPlacementPreview(index, name)
+			local groundCF = SharedBuildingService:GetPlacementCFrame(
+				grid,
+				name,
+				request.X,
+				request.Z,
+				request.Rotation
+			)
+			if model and groundCF then
+				SharedBuildingService:PivotModelToLevel(model, groundCF, grid.Origin.Y, request.Floor)
+			end
+		end
+		for index = #requests, #extraPreviewModels do
+			local extra = extraPreviewModels[index]
+			if extra then
+				extra:PivotTo(CFrame.new(0, -1000, 0))
+			end
+		end
+		updateIndicators(grid, name, requests)
+		return
 	end
 	-- No valid target: park the ghost far below the map and hide indicators.
 	previewModel:PivotTo(CFrame.new(0, -1000, 0))
+	hideExtraPreviews()
 	hideIndicators()
 	hideBuildPlane()
 end
@@ -590,6 +784,75 @@ local function onClick()
 	end
 end
 
+--[[Starts a configured item drag, or an area drag for the floor/ceiling tools. A
+non-draggable catalog item returns false so the caller can use normal click placement.]]
+local function beginDrag(): boolean
+	if not buildMode or deleteMode then
+		return false
+	end
+	local entry = selectedAsset and SharedBuildingService:GetEntry(selectedAsset)
+	if not paintMode and not ceilingMode and not (entry and entry.Draggable) then
+		return false
+	end
+	local base = getMyPlotBase()
+	if not base then
+		refreshStatus("no owned plot")
+		return true
+	end
+	local grid = buildMirrorGrid(base)
+	local x, z, hitPosition = cellUnderCursor(grid, currentFloor, ceilingMode)
+	if x == nil or z == nil or hitPosition == nil then
+		return true
+	end
+	local mode = if paintMode then "Paint" elseif ceilingMode then "Ceiling" else "Item"
+	local rotation = if mode == "Item"
+		then resolvePlacementRotation(grid, selectedAsset :: string, x, z, hitPosition)
+		else currentRotation
+	dragState = {
+		Mode = mode,
+		StartX = x,
+		StartZ = z,
+		LastX = x,
+		LastZ = z,
+		Floor = currentFloor,
+		Rotation = rotation,
+		Name = if mode == "Item" then selectedAsset else nil,
+		Material = if mode == "Paint" then paintMaterial elseif mode == "Ceiling" then ceilingMaterial else nil,
+	}
+	return true
+end
+
+local function finishDrag()
+	local state = dragState
+	if not state then
+		return
+	end
+	local base = getMyPlotBase()
+	if base then
+		local grid = buildMirrorGrid(base)
+		local x, z = cellUnderCursor(grid, state.Floor, state.Mode == "Ceiling")
+		if x ~= nil and z ~= nil then
+			state.LastX, state.LastZ = x, z
+		end
+	end
+	dragState = nil
+
+	if state.Mode == "Item" then
+		local requests = dragPlacements(state, state.LastX, state.LastZ)
+		local placed, reason = placeRemote:InvokeServer(state.Name, requests)
+		refreshStatus(if placed > 0 then `placed {placed}/{#requests}` else `rejected: {reason}`)
+	else
+		local requests = rectangleCells(state.StartX, state.StartZ, state.LastX, state.LastZ)
+		if state.Mode == "Paint" then
+			local painted, reason = paintRemote:InvokeServer(requests, state.Floor, state.Material)
+			refreshStatus(if painted > 0 then `painted {painted}/{#requests}` else `rejected: {reason}`)
+		else
+			local placed, reason = ceilingRemote:InvokeServer("placeBatch", requests, state.Floor, state.Material)
+			refreshStatus(if placed > 0 then `ceiling {placed}/{#requests}` else `rejected: {reason}`)
+		end
+	end
+end
+
 local function syncCameraMode()
 	cameraController:SetCeilingSelected(ceilingMode)
 	if buildMode and freeCameraMode then
@@ -606,11 +869,13 @@ local function setBuildMode(enabled: boolean)
 		syncCameraMode()
 		rebuildPreview()
 	else
+		dragState = nil
 		freeCameraMode = false
 		cameraController:SetEnabled(false)
 		if previewModel then
 			previewModel:PivotTo(CFrame.new(0, -1000, 0))
 		end
+		hideExtraPreviews()
 		hideIndicators()
 		hideTilePreview()
 		hideBuildPlane()
@@ -854,7 +1119,15 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	elseif input.KeyCode == Enum.KeyCode.R then
 		rotateSelection()
 	elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-		onClick()
+		if deleteMode or not beginDrag() then
+			onClick()
+		end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		finishDrag()
 	end
 end)
 

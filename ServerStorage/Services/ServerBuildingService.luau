@@ -21,6 +21,41 @@ local Grid = require(ReplicatedStorage.Classes.Grid)
 
 local ServerBuildingService = {}
 
+type PlacementRequest = { X: number, Z: number, Floor: number, Rotation: number }
+type CellRequest = { X: number, Z: number }
+
+local function isFiniteNumber(value: any): boolean
+	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function isGridInteger(value: any): boolean
+	return isFiniteNumber(value) and value % 1 == 0
+end
+
+local function isPlacementRequest(value: any): boolean
+	return type(value) == "table"
+		and isGridInteger(value.X)
+		and isGridInteger(value.Z)
+		and isGridInteger(value.Floor)
+		and isGridInteger(value.Rotation)
+end
+
+local function isCellRequest(value: any): boolean
+	return type(value) == "table" and isGridInteger(value.X) and isGridInteger(value.Z)
+end
+
+local function isRequestList(value: any, validator: (any) -> boolean): boolean
+	if type(value) ~= "table" then
+		return false
+	end
+	for _, request in value do
+		if not validator(request) then
+			return false
+		end
+	end
+	return true
+end
+
 -- Remotes are authored in Studio under ReplicatedStorage.Communication.Building
 -- (never created programmatically). See the list at the bottom of this file.
 local Communication = ReplicatedStorage:WaitForChild("Communication")
@@ -253,9 +288,30 @@ local function derenderCeiling(plot, x: number, z: number, floor: number)
 	end
 end
 
---[[
-Attempts to place an asset for a player. Returns the new placement id, or nil + reason.
-]]
+-- Validates and commits one placement without persisting, so clicks and drags share
+-- exactly one authoritative path.
+local function placeOne(plot, name: string, x: number, z: number, floor: number, rotation: number): (number?, string?)
+	local grid = plot:GetGrid()
+	local ok, reason = SharedBuildingService:CanPlace(grid, name, x, z, floor, rotation)
+	if not ok then
+		return nil, reason
+	end
+	-- TODO: verify the player can afford this asset and deduct the cost here, before commit.
+	local cells, edges = SharedBuildingService:ResolveOccupancy(name, x, z, floor, rotation)
+	local id = grid:AddPlacement({
+		Name = name,
+		X = x,
+		Z = z,
+		Floor = floor,
+		Rotation = rotation,
+		Cells = cells,
+		Edges = edges,
+	})
+	render(plot, grid:GetPlacement(id))
+	return id
+end
+
+--[[Attempts to place one asset for a player.]]
 function ServerBuildingService:Place(
 	player: Player,
 	name: string,
@@ -268,30 +324,43 @@ function ServerBuildingService:Place(
 	if not plot then
 		return nil, "no plot"
 	end
+	local id, reason = placeOne(plot, name, x, z, floor, rotation)
+	if id then
+		persist(plot)
+	end
+	return id, reason
+end
 
+--[[Places every valid member of one configured drag. Invalid members are skipped so
+collisions do not discard the rest of the player's dragged wall/area.]]
+function ServerBuildingService:PlaceBatch(player: Player, name: string, requests: { PlacementRequest }): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
 	local grid = plot:GetGrid()
-
-	local ok, reason = SharedBuildingService:CanPlace(grid, name, x, z, floor, rotation)
-	if not ok then
-		return nil, reason
+	local entry = SharedBuildingService:GetEntry(name)
+	if not entry or not entry.Draggable then
+		return 0, "asset is not draggable"
+	end
+	if #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0, "invalid drag"
 	end
 
-	-- TODO: verify the player can afford this asset and deduct the cost here, before commit.
-
-	local cells, edges = SharedBuildingService:ResolveOccupancy(name, x, z, floor, rotation)
-	local id = grid:AddPlacement({
-		Name = name,
-		X = x,
-		Z = z,
-		Floor = floor,
-		Rotation = rotation,
-		Cells = cells,
-		Edges = edges,
-	})
-
-	render(plot, grid:GetPlacement(id))
-	persist(plot)
-	return id
+	local placed = 0
+	local firstReason: string? = nil
+	for _, request in requests do
+		local id, reason = placeOne(plot, name, request.X, request.Z, request.Floor, request.Rotation)
+		if not id then
+			firstReason = firstReason or reason
+			continue
+		end
+		placed += 1
+	end
+	if placed > 0 then
+		persist(plot)
+	end
+	return placed, firstReason
 end
 
 --[[
@@ -325,25 +394,60 @@ function ServerBuildingService:PaintFloor(player: Player, x: number, z: number, 
 	if not plot then
 		return false, "no plot"
 	end
-	if floor < 1 or floor % 1 ~= 0 then
-		return false, "invalid floor"
-	end
 	if materialIndex < 1 or materialIndex > #Materials.Floor then
 		return false, "invalid material"
 	end
 
 	local grid = plot:GetGrid()
-	if not grid:IsInBounds(x, z) then
-		return false, "out of bounds"
-	end
-	if floor > 1 and not grid:GetCeiling(x, z, floor - 1) then
-		return false, "no ceiling here"
+	local valid, reason = SharedBuildingService:CanPaintFloor(grid, x, z, floor)
+	if not valid then
+		return false, reason
 	end
 
 	grid:SetFloorMaterial(x, z, floor, materialIndex)
 	remeshFloor(plot, floor)
 	persist(plot)
 	return true
+end
+
+--[[Paints the valid cells in an X/Z drag and remeshes only once.]]
+function ServerBuildingService:PaintFloorBatch(
+	player: Player,
+	requests: { CellRequest },
+	floor: number,
+	materialIndex: number
+): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
+	if floor < 1 or floor % 1 ~= 0 then
+		return 0, "invalid floor"
+	end
+	if materialIndex < 1 or materialIndex > #Materials.Floor then
+		return 0, "invalid material"
+	end
+	local grid = plot:GetGrid()
+	if #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0, "invalid drag"
+	end
+
+	local painted = 0
+	local seen = {}
+	for _, request in requests do
+		local key = `{request.X},{request.Z}`
+		local valid = not seen[key] and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor)
+		seen[key] = true
+		if valid then
+			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex)
+			painted += 1
+		end
+	end
+	if painted > 0 then
+		remeshFloor(plot, floor)
+		persist(plot)
+	end
+	return painted, if painted > 0 then nil else "no valid floor cells"
 end
 
 --[[
@@ -387,6 +491,39 @@ function ServerBuildingService:PlaceCeiling(
 	return true
 end
 
+--[[Places every valid ceiling in an area drag. Support is resolved in passes so any
+connected portion touching a wall or existing ceiling can spread across the selection.]]
+function ServerBuildingService:PlaceCeilingBatch(
+	player: Player,
+	requests: { CellRequest },
+	floor: number,
+	materialIndex: number
+): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
+	if floor < 1 or floor % 1 ~= 0 then
+		return 0, "invalid floor"
+	end
+	if materialIndex < 1 or materialIndex > #Materials.Ceiling then
+		return 0, "invalid material"
+	end
+	local grid = plot:GetGrid()
+	if #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0, "invalid drag"
+	end
+
+	local placed = SharedBuildingService:FillCeilings(grid, requests, floor, materialIndex)
+	for _, result in placed do
+		renderCeiling(plot, result.X, result.Z, floor, result.TopOffset, materialIndex)
+	end
+	if #placed > 0 then
+		persist(plot)
+	end
+	return #placed, if #placed > 0 then nil else "no supported ceiling cells"
+end
+
 --[[
 Removes a ceiling and clears the painted tile that rested on it one level above.
 ]]
@@ -411,37 +548,48 @@ end
 -- Client entry points (RemoteFunctions so the client gets accept/reject feedback for
 -- its preview). Basic numeric guards keep malformed requests from erroring the grid;
 -- full validation lives in :Place / :Remove. TODO: per-player rate limiting.
-local function isFiniteNumber(value: any): boolean
-	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
-end
-
 placeRemote.OnServerInvoke = function(player, name, x, z, floor, rotation)
-	if type(name) ~= "string" or not (isFiniteNumber(x) and isFiniteNumber(z) and isFiniteNumber(floor) and isFiniteNumber(rotation)) then
+	if type(name) == "string" and isRequestList(x, isPlacementRequest) then
+		return ServerBuildingService:PlaceBatch(player, name, x)
+	end
+	if type(name) ~= "string" or not (isGridInteger(x) and isGridInteger(z) and isGridInteger(floor) and isGridInteger(rotation)) then
 		return nil, "bad request"
 	end
 	return ServerBuildingService:Place(player, name, x, z, floor, rotation)
 end
 
 removeRemote.OnServerInvoke = function(player, placementId)
-	if not isFiniteNumber(placementId) then
+	if not isGridInteger(placementId) then
 		return false
 	end
 	return ServerBuildingService:Remove(player, placementId)
 end
 
 paintRemote.OnServerInvoke = function(player, x, z, floor, materialIndex)
-	if not (isFiniteNumber(x) and isFiniteNumber(z) and isFiniteNumber(floor) and isFiniteNumber(materialIndex)) then
+	if isRequestList(x, isCellRequest) then
+		if not (isGridInteger(z) and isGridInteger(floor)) then
+			return 0, "bad request"
+		end
+		return ServerBuildingService:PaintFloorBatch(player, x, z, floor)
+	end
+	if not (isGridInteger(x) and isGridInteger(z) and isGridInteger(floor) and isGridInteger(materialIndex)) then
 		return false
 	end
 	return ServerBuildingService:PaintFloor(player, x, z, floor, materialIndex)
 end
 
 ceilingRemote.OnServerInvoke = function(player, action, x, z, floor, materialIndex)
-	if not (isFiniteNumber(x) and isFiniteNumber(z) and isFiniteNumber(floor)) then
+	if action == "placeBatch" and isRequestList(x, isCellRequest) then
+		if not (isGridInteger(z) and isGridInteger(floor)) then
+			return 0, "bad request"
+		end
+		return ServerBuildingService:PlaceCeilingBatch(player, x, z, floor)
+	end
+	if not (isGridInteger(x) and isGridInteger(z) and isGridInteger(floor)) then
 		return false
 	end
 	if action == "place" then
-		if not isFiniteNumber(materialIndex) then
+		if not isGridInteger(materialIndex) then
 			return false
 		end
 		return ServerBuildingService:PlaceCeiling(player, x, z, floor, materialIndex)
