@@ -330,57 +330,23 @@ function SharedBuildingService:PivotModelToLevel(model: Model, placementCFrame: 
 	model:PivotTo(model:GetPivot() + Vector3.new(0, baseY - bottomY, 0))
 end
 
---[[Returns a ceiling's fixed top offset when it has a bordering wall on this level or
-an adjacent ceiling on this level. Adjacent tiles let a ceiling spread inward.]]
-function SharedBuildingService:GetCeilingTopOffset(grid: Grid.Grid, x: number, z: number, floor: number): number?
-	for _, key in {
-		Grid.edgeKey("H", x, z, floor),
-		Grid.edgeKey("H", x, z + 1, floor),
-		Grid.edgeKey("V", x, z, floor),
-		Grid.edgeKey("V", x + 1, z, floor),
-	} do
-		if grid:GetEdgeOccupant(key) then
-			return self:GetLevelTopOffset(floor)
-		end
-	end
-	for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
-		if grid:GetCeiling(x + offset[1], z + offset[2], floor) then
-			return self:GetLevelTopOffset(floor)
-		end
-	end
-	return nil
-end
-
---[[Adds every supported member of a ceiling selection to the supplied grid. Repeated
-passes let support spread from any wall/existing ceiling through connected cells. The
-client calls this on its throwaway mirror; the server calls it on the real grid.]]
+--[[Adds every available member of a floor-slab selection to the supplied grid. Slabs
+may float freely; the client calls this on its mirror and the server on the real grid.]]
 function SharedBuildingService:FillCeilings(
 	grid: Grid.Grid,
 	cells: { { X: number, Z: number } },
 	floor: number,
 	material: number
 ): { { Index: number, X: number, Z: number, TopOffset: number } }
-	local pending, placed, seen = {}, {}, {}
+	local placed, seen = {}, {}
+	local topOffset = self:GetLevelTopOffset(floor)
 	for index, cell in cells do
 		local key = `{cell.X},{cell.Z}`
 		if not seen[key] and grid:IsInBounds(cell.X, cell.Z) and not grid:GetCeiling(cell.X, cell.Z, floor) then
-			table.insert(pending, { Index = index, X = cell.X, Z = cell.Z })
+			grid:SetCeiling(cell.X, cell.Z, floor, topOffset, material)
+			table.insert(placed, { Index = index, X = cell.X, Z = cell.Z, TopOffset = topOffset })
 		end
 		seen[key] = true
-	end
-	local progressed = true
-	while progressed do
-		progressed = false
-		for index = #pending, 1, -1 do
-			local cell = pending[index]
-			local topOffset = self:GetCeilingTopOffset(grid, cell.X, cell.Z, floor)
-			if topOffset then
-				grid:SetCeiling(cell.X, cell.Z, floor, topOffset, material)
-				table.insert(placed, { Index = cell.Index, X = cell.X, Z = cell.Z, TopOffset = topOffset })
-				table.remove(pending, index)
-				progressed = true
-			end
-		end
 	end
 	return placed
 end
@@ -495,34 +461,11 @@ function SharedBuildingService:CanPlace(
 			return false, "out of bounds"
 		end
 	end
-	if floor > 1 then
-		if entry.Type == "Wall" then
-			local length = entry.Footprint.Width
-			local pi = pivotIndex(length)
-			local orientation, ex, ez = wallEdgeParams(x, z, rotation)
-			for i = 0, length - 1 do
-				local offset = i - pi
-				local belowKey
-				local firstCeiling
-				local secondCeiling
-				if orientation == "H" then
-					belowKey = Grid.edgeKey("H", ex + offset, ez, floor - 1)
-					firstCeiling = grid:GetCeiling(ex + offset, ez, floor - 1)
-					secondCeiling = grid:GetCeiling(ex + offset, ez - 1, floor - 1)
-				else
-					belowKey = Grid.edgeKey("V", ex, ez + offset, floor - 1)
-					firstCeiling = grid:GetCeiling(ex, ez + offset, floor - 1)
-					secondCeiling = grid:GetCeiling(ex - 1, ez + offset, floor - 1)
-				end
-				if not grid:GetEdgeOccupant(belowKey) and not firstCeiling and not secondCeiling then
-					return false, "needs support below"
-				end
-			end
-		else
-			for _, coord in computeCellCoords(entry, x, z, rotation) do
-				if not grid:GetCeiling(coord[1], coord[2], floor - 1) then
-					return false, "needs ceiling below"
-				end
+	-- Structural pieces may float; ordinary content must rest on a slab below.
+	if floor > 1 and entry.Type ~= "Wall" and entry.Type ~= "Floor" then
+		for _, coord in computeCellCoords(entry, x, z, rotation) do
+			if not grid:GetCeiling(coord[1], coord[2], floor - 1) then
+				return false, "needs ceiling below"
 			end
 		end
 	end

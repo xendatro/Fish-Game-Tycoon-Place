@@ -17,7 +17,7 @@ Building.CELL_SIZE = 4
 -- a ceiling slab's top surface is placed on the second value.
 Building.WALL_HEIGHT = 8
 
--- Ceiling/floor slab thickness. The slab's TOP is flush with the supporting wall top
+-- Ceiling/floor slab thickness. The slab's top is flush with the selected level top
 -- (which becomes the next build floor's surface); its thickness hangs below that line.
 Building.CEILING_THICKNESS = 1
 

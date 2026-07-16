@@ -25,6 +25,8 @@ local Building = require(ReplicatedStorage.Config.Building)
 local Materials = require(ReplicatedStorage.Config.Materials)
 local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
 
+local DELETE_FILL_TRANSPARENCY = 0.85
+
 -- Remotes authored in Studio under ReplicatedStorage.Communication.Building.
 local BuildingRemotes = ReplicatedStorage:WaitForChild("Communication"):WaitForChild("Building")
 local placeRemote = BuildingRemotes:WaitForChild("Place") :: RemoteFunction
@@ -178,7 +180,7 @@ local function getDeleteHighlight(index: number): SelectionBox
 		highlight.Color3 = Color3.fromRGB(220, 60, 60)
 		highlight.LineThickness = 0.06
 		highlight.SurfaceColor3 = Color3.fromRGB(220, 60, 60)
-		highlight.SurfaceTransparency = 0.85
+		highlight.SurfaceTransparency = DELETE_FILL_TRANSPARENCY
 		highlight.Parent = indicatorFolder
 		deleteHighlights[index] = highlight
 	end
@@ -280,16 +282,6 @@ local function deleteRaycast(): (Instance?, Vector3?)
 	local ray = player:GetMouse().UnitRay
 	local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
 	return if result then result.Instance else nil, if result then result.Position else nil
-end
-
---[[Outlines the visible placement under the cursor.]]
-local function updateDeleteHover()
-	hideIndicators()
-	hideTilePreview()
-	local target = deleteRaycast()
-	local model = findPlacementModel(target)
-	local ceiling = findCeilingPart(target)
-	setDeleteHighlights(if model or ceiling then { model or ceiling } else {})
 end
 
 -- The player's own plot is found via the Owner attribute set by Plot:Assign.
@@ -660,11 +652,16 @@ local function existingDeleteCells(state: DeleteDragState, cells: { CellRequest 
 	return existing
 end
 
-local function updateDeleteCells(grid: Grid.Grid, state: DeleteDragState, cells: { CellRequest })
+local function updateDeleteCells(
+	grid: Grid.Grid,
+	kind: "Ceiling" | "Floor",
+	floor: number,
+	cells: { CellRequest }
+)
 	hideDeleteHighlight()
-	local ceiling = state.Kind == "Ceiling"
+	local ceiling = kind == "Ceiling"
 	local y = grid.Origin.Y
-		+ (if ceiling then SharedBuildingService:GetLevelTopOffset(state.Floor) else SharedBuildingService:GetLevelBaseOffset(state.Floor))
+		+ (if ceiling then SharedBuildingService:GetLevelTopOffset(floor) else SharedBuildingService:GetLevelBaseOffset(floor))
 	for index, cell in cells do
 		local centre = grid:GetCellCenter(cell.X, cell.Z)
 		local indicator = getIndicator(index)
@@ -679,12 +676,40 @@ local function updateDeleteCells(grid: Grid.Grid, state: DeleteDragState, cells:
 			centre.Z
 		)
 		local outline = indicator:FindFirstChild("Outline") :: SelectionBox
+		outline.SurfaceColor3 = outline.Color3
+		outline.SurfaceTransparency = DELETE_FILL_TRANSPARENCY
 		outline.Visible = true
 		indicator.Parent = indicatorFolder
 	end
 	for index = #cells + 1, #indicators do
 		indicators[index].Parent = nil
 	end
+end
+
+--[[Outlines the visible placement or exact merged-floor cell under the cursor.]]
+local function updateDeleteHover()
+	hideTilePreview()
+	local target, hitPosition = deleteRaycast()
+	local model = findPlacementModel(target)
+	local ceiling = findCeilingPart(target)
+	if model or ceiling then
+		hideIndicators()
+		setDeleteHighlights({ model or ceiling })
+		return
+	end
+
+	local floor = target and target:GetAttribute("FloorLevel")
+	local base = getMyPlotBase()
+	if typeof(floor) ~= "number" or not base or not hitPosition then
+		hideIndicators()
+		hideDeleteHighlight()
+		return
+	end
+	local grid = Grid.new(base)
+	local x, z = grid:WorldToCell(hitPosition)
+	updateDeleteCells(grid, "Floor", floor, {
+		{ X = math.clamp(x, 0, grid.Width - 1), Z = math.clamp(z, 0, grid.Depth - 1) },
+	})
 end
 
 local function updateDeleteHighlight()
@@ -711,7 +736,7 @@ local function updateDeleteHighlight()
 		setDeleteHighlights(deleteSelection(state, state.LastX, state.LastZ))
 	else
 		local cells = existingDeleteCells(state, deleteCells(state, state.LastX, state.LastZ))
-		updateDeleteCells(grid, state, cells)
+		updateDeleteCells(grid, state.Kind, state.Floor, cells)
 	end
 end
 
@@ -801,6 +826,7 @@ local function updateIndicators(grid: Grid.Grid, name: string, requests: { Place
 			indicator.Size = piece.Size
 			indicator.CFrame = piece.CFrame
 			local outline = indicator:FindFirstChild("Outline") :: SelectionBox
+			outline.SurfaceTransparency = 1
 			outline.Visible = not canPlace or not piece.InBounds or grid:IsOccupied(piece.Key)
 			indicator.Parent = indicatorFolder
 		end

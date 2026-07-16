@@ -255,7 +255,7 @@ local function getCeilingContainer(plot): Folder
 end
 
 --[[Renders a cell-sized ceiling slab from its stored top-surface offset. Its top is flush
-with the supporting wall top (the next floor surface) and the thickness hangs below it.]]
+with the selected level top (the next floor surface) and its thickness hangs below it.]]
 local function renderCeiling(plot, x: number, z: number, floor: number, topOffset: number, materialIndex: number)
 	local container = getCeilingContainer(plot)
 	local key = Grid.ceilingKey(x, z, floor)
@@ -417,7 +417,7 @@ function ServerBuildingService:PaintFloor(
 	return painted, if painted > 0 then nil else "no changed floor cells"
 end
 
---[[Places supported requests. Shared propagation handles both clicks and area drags.]]
+--[[Places every available requested slab. The same path handles clicks and area drags.]]
 function ServerBuildingService:PlaceCeiling(
 	player: Player,
 	requests: { CellRequest },
@@ -446,7 +446,7 @@ function ServerBuildingService:PlaceCeiling(
 	if #placed > 0 then
 		persist(plot)
 	end
-	return #placed, if #placed > 0 then nil else "no supported ceiling cells"
+	return #placed, if #placed > 0 then nil else "no available floor cells"
 end
 
 --[[
