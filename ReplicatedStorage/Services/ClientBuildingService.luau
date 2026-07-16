@@ -37,11 +37,10 @@ local player = Players.LocalPlayer
 type PlacementRequest = { X: number, Z: number, Floor: number, Rotation: number }
 type CellRequest = { X: number, Z: number }
 
---[[Requests a placement. Returns the server's (placementId?, reason?) so the caller
-can confirm or roll back its preview. Assumes the caller already previewed with
-SharedBuildingService:CanPlace so this normally matches what the server accepts.]]
-function ClientBuildingService:RequestPlace(name: string, x: number, z: number, floor: number, rotation: number): (number?, string?)
-	return placeRemote:InvokeServer(name, x, z, floor, rotation)
+-- Single clicks use the same bulk remote contract as drags.
+function ClientBuildingService:RequestPlace(name: string, x: number, z: number, floor: number, rotation: number): (boolean, string?)
+	local count, reason = placeRemote:InvokeServer(name, { { X = x, Z = z, Floor = floor, Rotation = rotation } })
+	return count > 0, reason
 end
 
 --[[Requests removal of a placement by id (read from the rendered instance). Returns success.]]
@@ -51,12 +50,14 @@ end
 
 --[[Requests painting a cell's floor material. Returns success + reason.]]
 function ClientBuildingService:RequestPaint(x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
-	return paintRemote:InvokeServer(x, z, floor, materialIndex)
+	local count, reason = paintRemote:InvokeServer({ { X = x, Z = z } }, floor, materialIndex)
+	return count > 0, reason
 end
 
 --[[Requests placing a ceiling at the top of the selected wall level.]]
 function ClientBuildingService:RequestPlaceCeiling(x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
-	return ceilingRemote:InvokeServer("place", x, z, floor, materialIndex)
+	local count, reason = ceilingRemote:InvokeServer("place", { { X = x, Z = z } }, floor, materialIndex)
+	return count > 0, reason
 end
 
 --[[Requests removing the ceiling on one selected build floor.]]
@@ -779,8 +780,8 @@ local function onClick()
 		refreshStatus(if ok then `ceiling ({x},{z})` else `rejected: {reason}`)
 	else
 		local rotation = resolvePlacementRotation(grid, selectedAsset :: string, x, z, hitPosition :: Vector3)
-		local id, reason = ClientBuildingService:RequestPlace(selectedAsset :: string, x, z, currentFloor, rotation)
-		refreshStatus(if id then `placed ({x},{z})` else `rejected: {reason}`)
+		local ok, reason = ClientBuildingService:RequestPlace(selectedAsset :: string, x, z, currentFloor, rotation)
+		refreshStatus(if ok then `placed ({x},{z})` else `rejected: {reason}`)
 	end
 end
 
@@ -847,7 +848,7 @@ local function finishDrag()
 			local painted, reason = paintRemote:InvokeServer(requests, state.Floor, state.Material)
 			refreshStatus(if painted > 0 then `painted {painted}/{#requests}` else `rejected: {reason}`)
 		else
-			local placed, reason = ceilingRemote:InvokeServer("placeBatch", requests, state.Floor, state.Material)
+			local placed, reason = ceilingRemote:InvokeServer("place", requests, state.Floor, state.Material)
 			refreshStatus(if placed > 0 then `ceiling {placed}/{#requests}` else `rejected: {reason}`)
 		end
 	end

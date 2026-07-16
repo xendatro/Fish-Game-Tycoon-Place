@@ -311,36 +311,15 @@ local function placeOne(plot, name: string, x: number, z: number, floor: number,
 	return id
 end
 
---[[Attempts to place one asset for a player.]]
-function ServerBuildingService:Place(
-	player: Player,
-	name: string,
-	x: number,
-	z: number,
-	floor: number,
-	rotation: number
-): (number?, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot then
-		return nil, "no plot"
-	end
-	local id, reason = placeOne(plot, name, x, z, floor, rotation)
-	if id then
-		persist(plot)
-	end
-	return id, reason
-end
-
---[[Places every valid member of one configured drag. Invalid members are skipped so
-collisions do not discard the rest of the player's dragged wall/area.]]
-function ServerBuildingService:PlaceBatch(player: Player, name: string, requests: { PlacementRequest }): (number, string?)
+--[[Places every valid request. An ordinary click is simply a one-entry request list.]]
+function ServerBuildingService:Place(player: Player, name: string, requests: { PlacementRequest }): (number, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
 		return 0, "no plot"
 	end
 	local grid = plot:GetGrid()
 	local entry = SharedBuildingService:GetEntry(name)
-	if not entry or not entry.Draggable then
+	if not entry or (#requests > 1 and not entry.Draggable) then
 		return 0, "asset is not draggable"
 	end
 	if #requests < 1 or #requests > grid.Width * grid.Depth then
@@ -385,33 +364,8 @@ function ServerBuildingService:Remove(player: Player, placementId: number): bool
 	return true
 end
 
---[[
-Paints a cell's floor material on the given level. Level 1 always works (grass reverts).
-Higher levels require a ceiling directly below. Returns success + reason.
-]]
-function ServerBuildingService:PaintFloor(player: Player, x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot then
-		return false, "no plot"
-	end
-	if materialIndex < 1 or materialIndex > #Materials.Floor then
-		return false, "invalid material"
-	end
-
-	local grid = plot:GetGrid()
-	local valid, reason = SharedBuildingService:CanPaintFloor(grid, x, z, floor)
-	if not valid then
-		return false, reason
-	end
-
-	grid:SetFloorMaterial(x, z, floor, materialIndex)
-	remeshFloor(plot, floor)
-	persist(plot)
-	return true
-end
-
---[[Paints the valid cells in an X/Z drag and remeshes only once.]]
-function ServerBuildingService:PaintFloorBatch(
+--[[Paints every valid request and remeshes once. A click sends one request.]]
+function ServerBuildingService:PaintFloor(
 	player: Player,
 	requests: { CellRequest },
 	floor: number,
@@ -450,50 +404,8 @@ function ServerBuildingService:PaintFloorBatch(
 	return painted, if painted > 0 then nil else "no valid floor cells"
 end
 
---[[
-Places a ceiling at the top of the selected fixed-height wall segment. A bordering wall or
-adjacent ceiling on the same level supplies support. Returns success + reason.
-]]
+--[[Places supported requests. Shared propagation handles both clicks and area drags.]]
 function ServerBuildingService:PlaceCeiling(
-	player: Player,
-	x: number,
-	z: number,
-	floor: number,
-	materialIndex: number
-): (boolean, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot then
-		return false, "no plot"
-	end
-	if materialIndex < 1 or materialIndex > #Materials.Ceiling then
-		return false, "invalid material"
-	end
-	if floor < 1 or floor % 1 ~= 0 then
-		return false, "invalid floor"
-	end
-
-	local grid = plot:GetGrid()
-	if not grid:IsInBounds(x, z) then
-		return false, "out of bounds"
-	end
-	if grid:GetCeiling(x, z, floor) then
-		return false, "ceiling already here"
-	end
-
-	local topOffset = SharedBuildingService:GetCeilingTopOffset(grid, x, z, floor)
-	if not topOffset then
-		return false, "needs a wall or ceiling"
-	end
-
-	grid:SetCeiling(x, z, floor, topOffset, materialIndex)
-	renderCeiling(plot, x, z, floor, topOffset, materialIndex)
-	persist(plot)
-	return true
-end
-
---[[Places every valid ceiling in an area drag. Support is resolved in passes so any
-connected portion touching a wall or existing ceiling can spread across the selection.]]
-function ServerBuildingService:PlaceCeilingBatch(
 	player: Player,
 	requests: { CellRequest },
 	floor: number,
@@ -548,14 +460,11 @@ end
 -- Client entry points (RemoteFunctions so the client gets accept/reject feedback for
 -- its preview). Basic numeric guards keep malformed requests from erroring the grid;
 -- full validation lives in :Place / :Remove. TODO: per-player rate limiting.
-placeRemote.OnServerInvoke = function(player, name, x, z, floor, rotation)
-	if type(name) == "string" and isRequestList(x, isPlacementRequest) then
-		return ServerBuildingService:PlaceBatch(player, name, x)
+placeRemote.OnServerInvoke = function(player, name, requests)
+	if type(name) ~= "string" or not isRequestList(requests, isPlacementRequest) then
+		return 0, "bad request"
 	end
-	if type(name) ~= "string" or not (isGridInteger(x) and isGridInteger(z) and isGridInteger(floor) and isGridInteger(rotation)) then
-		return nil, "bad request"
-	end
-	return ServerBuildingService:Place(player, name, x, z, floor, rotation)
+	return ServerBuildingService:Place(player, name, requests)
 end
 
 removeRemote.OnServerInvoke = function(player, placementId)
@@ -565,36 +474,23 @@ removeRemote.OnServerInvoke = function(player, placementId)
 	return ServerBuildingService:Remove(player, placementId)
 end
 
-paintRemote.OnServerInvoke = function(player, x, z, floor, materialIndex)
-	if isRequestList(x, isCellRequest) then
-		if not (isGridInteger(z) and isGridInteger(floor)) then
-			return 0, "bad request"
-		end
-		return ServerBuildingService:PaintFloorBatch(player, x, z, floor)
+paintRemote.OnServerInvoke = function(player, requests, floor, materialIndex)
+	if not isRequestList(requests, isCellRequest) or not (isGridInteger(floor) and isGridInteger(materialIndex)) then
+		return 0, "bad request"
 	end
-	if not (isGridInteger(x) and isGridInteger(z) and isGridInteger(floor) and isGridInteger(materialIndex)) then
-		return false
-	end
-	return ServerBuildingService:PaintFloor(player, x, z, floor, materialIndex)
+	return ServerBuildingService:PaintFloor(player, requests, floor, materialIndex)
 end
 
-ceilingRemote.OnServerInvoke = function(player, action, x, z, floor, materialIndex)
-	if action == "placeBatch" and isRequestList(x, isCellRequest) then
-		if not (isGridInteger(z) and isGridInteger(floor)) then
+ceilingRemote.OnServerInvoke = function(player, action, target, second, third)
+	if action == "place" then
+		if not isRequestList(target, isCellRequest) or not (isGridInteger(second) and isGridInteger(third)) then
 			return 0, "bad request"
 		end
-		return ServerBuildingService:PlaceCeilingBatch(player, x, z, floor)
-	end
-	if not (isGridInteger(x) and isGridInteger(z) and isGridInteger(floor)) then
-		return false
-	end
-	if action == "place" then
-		if not isGridInteger(materialIndex) then
-			return false
-		end
-		return ServerBuildingService:PlaceCeiling(player, x, z, floor, materialIndex)
+		return ServerBuildingService:PlaceCeiling(player, target, second, third)
 	elseif action == "remove" then
-		return ServerBuildingService:RemoveCeiling(player, x, z, floor)
+		if isGridInteger(target) and isGridInteger(second) and isGridInteger(third) then
+			return ServerBuildingService:RemoveCeiling(player, target, second, third)
+		end
 	end
 	return false
 end
