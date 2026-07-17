@@ -193,6 +193,11 @@ function Grid:GetFloorEntry(x: number, z: number, floor: number): FloorEntry?
 	return self._floors[Grid.cellKey(x, z, floor)]
 end
 
+--[[Returns all explicitly painted floor entries.]]
+function Grid:GetFloorEntries(): { [string]: FloorEntry }
+	return self._floors
+end
+
 -- ===== Ceiling layer ========================================================
 
 --[[Canonical key for the ceiling capping a cell on one build floor.]]
@@ -214,6 +219,11 @@ end
 --[[Returns the ceiling capping a cell, or nil.]]
 function Grid:GetCeiling(x: number, z: number, floor: number): CeilingEntry?
 	return self._ceilings[Grid.ceilingKey(x, z, floor)]
+end
+
+--[[Returns all ceiling entries.]]
+function Grid:GetCeilings(): { [string]: CeilingEntry }
+	return self._ceilings
 end
 
 --[[Removes the ceiling capping a cell. Returns whether one was present.]]

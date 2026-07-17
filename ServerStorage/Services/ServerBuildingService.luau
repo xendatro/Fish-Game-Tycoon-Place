@@ -6,8 +6,8 @@ ServerBuildingService - the authority for building. It:
   * renders the result on the server (so it replicates to everyone),
   * charges money and persists the compressed grid into the profile.
 
-Rendering, money, and persistence are stubbed below with clear TODOs - the request
--> validate -> commit pipeline and the plumbing are in place.
+Money is still stubbed; placement, rendering, history, and profile persistence are
+server-authoritative.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -15,6 +15,7 @@ local ServerStorage = game:GetService("ServerStorage")
 local Players = game:GetService("Players")
 
 local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
+local DataSaveService = require(ReplicatedStorage.Services.DataSaveService)
 local ServerPlotService = require(ServerStorage.Services.ServerPlotService)
 local Building = require(ReplicatedStorage.Config.Building)
 local Materials = require(ReplicatedStorage.Config.Materials)
@@ -43,6 +44,7 @@ type HistoryEntry =
 type HistoryState = { Undo: { HistoryEntry }, Redo: { HistoryEntry } }
 
 local Histories: { [Player]: HistoryState } = {}
+local AssignedPlots = {}
 
 local function isFiniteNumber(value: any): boolean
 	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -85,6 +87,7 @@ local removeRemote = BuildingRemotes:WaitForChild("Remove") :: RemoteFunction
 local paintRemote = BuildingRemotes:WaitForChild("Paint") :: RemoteFunction
 local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
 local historyRemote = BuildingRemotes:WaitForChild("History") :: RemoteFunction
+local resetRemote = BuildingRemotes:WaitForChild("Reset") :: RemoteFunction
 
 local function pushHistory(player: Player, entry: HistoryEntry)
 	local history = Histories[player]
@@ -99,16 +102,15 @@ local function pushHistory(player: Player, entry: HistoryEntry)
 	table.clear(history.Redo)
 end
 
---[[Marks a plot's grid dirty so its compressed form is written back to the owner's
-profile (debounced). TODO: wire to DataSaveService profile field + debounce.]]
-local function persist(_plot)
-	-- local blob = plot:GetGrid():Compress()
-	-- write blob into DataSaveService:GetProfile(plot.Owner).Data.Build (debounced)
+--[[Writes the authoritative grid into the reactive profile. ProfileStore controls the
+actual datastore save cadence and performs a final save when the session ends.]]
+local function persist(plot, owner: Player?)
+	owner = owner or plot:GetOwner()
+	local profile = owner and DataSaveService:GetProfile(owner)
+	if profile then
+		profile.Data.Build = plot:Serialize()
+	end
 end
-
---[[TODO(load): on profile load, rebuild the plot's grid from its saved blob via
-Grid.Decompress(blob, basePart, resolver), where resolver wraps
-SharedBuildingService:ResolveOccupancy, then render each placement.]]
 
 --[[Returns (creating if needed) the folder holding a plot's rendered build instances.]]
 local function getBuildContainer(plot): Folder
@@ -323,6 +325,58 @@ local function derenderCeiling(plot, x: number, z: number, floor: number)
 	end
 end
 
+local function clearRendered(plot)
+	for _, name in { "Built", "Ceilings", "Floor" } do
+		local container = plot.Model:FindFirstChild(name)
+		if container then
+			container:Destroy()
+		end
+	end
+end
+
+local function emptyPlot(plot)
+	local base = plot.Model:FindFirstChild("Plot") :: BasePart
+	clearRendered(plot)
+	plot:SetGrid(Grid.new(base))
+end
+
+local function renderGrid(plot)
+	local grid = plot:GetGrid()
+	for _, placement in grid:GetPlacements() do
+		render(plot, placement)
+	end
+	for _, ceiling in grid:GetCeilings() do
+		renderCeiling(plot, ceiling.X, ceiling.Z, ceiling.Floor, ceiling.TopOffset, ceiling.Material)
+	end
+	local floors = {}
+	for _, floorEntry in grid:GetFloorEntries() do
+		floors[floorEntry.Floor] = true
+	end
+	for floor in floors do
+		remeshFloor(plot, floor)
+	end
+end
+
+local function loadPlot(player: Player, plot)
+	AssignedPlots[player] = plot
+	task.spawn(function()
+		local profile = DataSaveService:WaitForProfile(player)
+		if not profile or AssignedPlots[player] ~= plot or plot:GetOwner() ~= player then
+			return
+		end
+		local base = plot.Model:FindFirstChild("Plot") :: BasePart
+		local build = profile.Data.Build
+		local blob = if build.Serialize then build:Serialize() else build
+		local grid = Grid.Decompress(blob, base, function(name, x, z, floor, rotation)
+			return SharedBuildingService:ResolveOccupancy(name, x, z, floor, rotation)
+		end)
+		clearRendered(plot)
+		plot:SetGrid(grid)
+		renderGrid(plot)
+		Histories[player] = nil
+	end)
+end
+
 local function explicitFloorMaterial(grid: Grid.Grid, x: number, z: number, floor: number): number
 	local entry = grid:GetFloorEntry(x, z, floor)
 	return if entry then entry.Material else 0
@@ -401,6 +455,17 @@ local function stepHistory(player: Player, redo: boolean): (boolean, string?)
 	end
 	applyHistory(plot, entry, redo)
 	table.insert(target, entry)
+	return true
+end
+
+function ServerBuildingService:ResetBase(player: Player): boolean
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return false
+	end
+	emptyPlot(plot)
+	Histories[player] = nil
+	persist(plot)
 	return true
 end
 
@@ -692,8 +757,37 @@ historyRemote.OnServerInvoke = function(player, action)
 	return false, "bad request"
 end
 
+resetRemote.OnServerInvoke = function(player)
+	return ServerBuildingService:ResetBase(player)
+end
+
+ServerPlotService.PlotAssigned:Connect(function(player, plotNumber)
+	local plot = ServerPlotService:GetPlot(plotNumber)
+	if plot then
+		loadPlot(player, plot)
+	end
+end)
+ServerPlotService.PlotReleased:Connect(function(player, plotNumber)
+	local plot = ServerPlotService:GetPlot(plotNumber)
+	if not plot then
+		return
+	end
+	AssignedPlots[player] = nil
+	persist(plot, player)
+	emptyPlot(plot)
+	Histories[player] = nil
+end)
+
+for _, player in Players:GetPlayers() do
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if plot then
+		loadPlot(player, plot)
+	end
+end
+
 Players.PlayerRemoving:Connect(function(player)
 	Histories[player] = nil
+	AssignedPlots[player] = nil
 end)
 
 return ServerBuildingService

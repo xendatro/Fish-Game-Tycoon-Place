@@ -93,12 +93,14 @@ function Plot:GetGrid(): Grid.Grid
 	return self._grid
 end
 
---[[
-Placeholder for serializing the plot's built state. The heavy lifting now lives in
-Grid:Compress(); this stays as the plot-level hook for anything beyond the grid.
-]]
-function Plot:Serialize()
-	error("Plot:Serialize() is not yet implemented")
+--[[Replaces the runtime grid after loading or clearing authoritative build data.]]
+function Plot:SetGrid(grid: Grid.Grid)
+	self._grid = grid
+end
+
+--[[Returns the plot's persistent building state.]]
+function Plot:Serialize(): Grid.SaveBlob
+	return self:GetGrid():Compress()
 end
 
 return Plot

@@ -9,5 +9,11 @@ return {
 			Modifier = string?
 		}
 		]]
-	}
+	},
+	Build = {
+		Palette = {},
+		Placements = {},
+		Floors = {},
+		Ceilings = {},
+	},
 }

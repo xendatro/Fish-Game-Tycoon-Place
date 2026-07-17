@@ -1,10 +1,15 @@
 local Players = game:GetService("Players")
 local ServerStorage = game:GetService("ServerStorage")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Plot = require(ServerStorage.Classes.Plot)
+local Signal = require(ReplicatedStorage.Classes.Signal)
+local DataSaveService = require(ReplicatedStorage.Services.DataSaveService)
 
 local ServerPlotService = {}
+ServerPlotService.PlotAssigned = Signal.new()
+ServerPlotService.PlotReleased = Signal.new()
 
 -- All plots in the game, keyed by their number (their name in workspace.Plots).
 local plots: {[number]: Plot.Plot} = {}
@@ -65,12 +70,14 @@ function ServerPlotService:AssignPlot(player: Player, plot: number)
 		return
 	end
 	plotObject:Assign(player)
+	ServerPlotService.PlotAssigned:Fire(player, plotObject.Number)
 end
 
 --[[Releases whatever plot the player owns, making it open again.]]
 function ServerPlotService:ReleasePlot(player: Player)
 	local plotObject = ServerPlotService:GetPlayerPlot(player)
 	if plotObject then
+		ServerPlotService.PlotReleased:Fire(player, plotObject.Number)
 		plotObject:Release()
 	end
 end
@@ -83,6 +90,9 @@ local function teleportToPlot(player: Player, character: Model)
 end
 
 local function playerAdded(player: Player)
+	if not DataSaveService:WaitForProfile(player) then
+		return
+	end
 	local openPlots = ServerPlotService:GetOpenPlots()
 	if #openPlots == 0 then
 		player:Kick("No plots available - please rejoin.")

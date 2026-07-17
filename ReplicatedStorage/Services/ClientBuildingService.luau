@@ -34,6 +34,7 @@ local removeRemote = BuildingRemotes:WaitForChild("Remove") :: RemoteFunction
 local paintRemote = BuildingRemotes:WaitForChild("Paint") :: RemoteFunction
 local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
 local historyRemote = BuildingRemotes:WaitForChild("History") :: RemoteFunction
+local resetRemote = BuildingRemotes:WaitForChild("Reset") :: RemoteFunction
 
 local player = Players.LocalPlayer
 
@@ -1313,7 +1314,7 @@ local function buildDebugUI()
 	end
 
 	local tools = Instance.new("Frame")
-	tools.Size = UDim2.new(1, -8, 0, 102)
+	tools.Size = UDim2.new(1, -8, 0, 128)
 	tools.Position = UDim2.fromOffset(4, 46)
 	tools.BackgroundTransparency = 1
 	tools.Parent = panel
@@ -1325,7 +1326,7 @@ local function buildDebugUI()
 
 	local tabs = Instance.new("Frame")
 	tabs.Size = UDim2.new(1, -8, 0, 26)
-	tabs.Position = UDim2.fromOffset(4, 152)
+	tabs.Position = UDim2.fromOffset(4, 178)
 	tabs.BackgroundTransparency = 1
 	tabs.Parent = panel
 
@@ -1348,8 +1349,8 @@ local function buildDebugUI()
 	local function addPage(name: string): ScrollingFrame
 		local page = Instance.new("ScrollingFrame")
 		page.Name = name
-		page.Size = UDim2.new(1, -8, 1, -186)
-		page.Position = UDim2.fromOffset(4, 182)
+		page.Size = UDim2.new(1, -8, 1, -212)
+		page.Position = UDim2.fromOffset(4, 208)
 		page.BackgroundTransparency = 1
 		page.BorderSizePixel = 0
 		page.ScrollBarThickness = 6
@@ -1386,6 +1387,35 @@ local function buildDebugUI()
 	end)
 	addButton(tools, "Redo", function()
 		requestHistory("redo")
+	end)
+	local resetArmed = false
+	local resetVersion = 0
+	local resetButton: TextButton
+	resetButton = addButton(tools, "Reset Base", function()
+		if not resetArmed then
+			resetArmed = true
+			resetVersion += 1
+			local version = resetVersion
+			resetButton.Text = "CONFIRM RESET"
+			task.delay(3, function()
+				if resetArmed and resetVersion == version then
+					resetArmed = false
+					resetButton.Text = "Reset Base"
+				end
+			end)
+			return
+		end
+		resetArmed = false
+		resetVersion += 1
+		resetButton.Text = "Reset Base"
+		local reset = resetRemote:InvokeServer()
+		if reset then
+			currentFloor = 1
+			if freeCameraMode then
+				cameraController:SetLevel(currentFloor)
+			end
+		end
+		refreshStatus(if reset then "base reset" else "reset failed")
 	end)
 	addButton(tools, "Level -", function()
 		currentFloor = math.max(1, currentFloor - 1)
