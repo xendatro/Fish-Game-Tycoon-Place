@@ -26,6 +26,10 @@ Building.CEILING_THICKNESS = 1
 Building.FLOOR_THICKNESS = 0.2
 Building.SHOW_GRID_DURING_DELETE_DRAG = false
 
+-- Parts above the active build-camera floor remain visible but do not block build
+-- raycasts. Roblox transparency uses 0 = opaque and 1 = invisible.
+Building.HIDDEN_FLOOR_TRANSPARENCY = 0.75
+
 -- Temporary computer controls for the orbiting build camera.
 Building.Camera = {
 	PanSpeed = 32,

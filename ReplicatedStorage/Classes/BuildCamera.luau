@@ -108,7 +108,9 @@ function BuildCamera:_SetPartVisible(part: BasePart, visible: boolean)
 		}
 		self._partStates[part] = state
 	end
-	part.LocalTransparencyModifier = if visible then state.Transparency else 1
+	part.LocalTransparencyModifier = if visible
+		then state.Transparency
+		else math.max(state.Transparency, Building.HIDDEN_FLOOR_TRANSPARENCY)
 	self._hiddenParts[part] = if visible then nil else true
 end
 
