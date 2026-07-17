@@ -230,10 +230,11 @@ end
 
 --[[
 Registers a placement. Cells and Edges are the pre-computed occupancy the caller
-derived from the catalog footprint. Assigns and returns a fresh id. Does NOT
-validate - call the service's validation first.
+derived from the catalog footprint. A supplied id is used only when restoring undo
+history; normal placement assigns a fresh id. Does NOT validate.
 ]]
 function Grid:AddPlacement(data: {
+	Id: number?,
 	Name: string,
 	X: number,
 	Z: number,
@@ -242,8 +243,8 @@ function Grid:AddPlacement(data: {
 	Cells: { string },
 	Edges: { string },
 }): number
-	local id = self._nextId
-	self._nextId += 1
+	local id = data.Id or self._nextId
+	self._nextId = math.max(self._nextId, id + 1)
 
 	local placement: Placement = {
 		Id = id,

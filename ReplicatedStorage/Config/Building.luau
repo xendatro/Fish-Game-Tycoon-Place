@@ -30,6 +30,10 @@ Building.SHOW_GRID_DURING_DELETE_DRAG = false
 -- raycasts. Roblox transparency uses 0 = opaque and 1 = invisible.
 Building.HIDDEN_FLOOR_TRANSPARENCY = 0.75
 
+-- Undo history is server-authoritative but session-only. Each entry stores only the
+-- cells or placements changed by one click/drag, rather than a full plot snapshot.
+Building.UNDO_HISTORY_LIMIT = 50
+
 -- Temporary computer controls for the orbiting build camera.
 Building.Camera = {
 	PanSpeed = 32,

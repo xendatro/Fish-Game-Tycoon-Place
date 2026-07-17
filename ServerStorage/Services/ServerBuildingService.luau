@@ -12,6 +12,7 @@ Rendering, money, and persistence are stubbed below with clear TODOs - the reque
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
 
 local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
 local ServerPlotService = require(ServerStorage.Services.ServerPlotService)
@@ -23,6 +24,25 @@ local ServerBuildingService = {}
 
 type PlacementRequest = { X: number, Z: number, Floor: number, Rotation: number }
 type CellRequest = { X: number, Z: number }
+type PlacementChange = { Placement: Grid.Placement, BeforePresent: boolean, AfterPresent: boolean }
+type FloorChange = { X: number, Z: number, Floor: number, BeforeMaterial: number, AfterMaterial: number }
+type CeilingState = { TopOffset: number, Material: number }
+type CeilingChange = {
+	X: number,
+	Z: number,
+	Floor: number,
+	BeforeCeiling: CeilingState?,
+	AfterCeiling: CeilingState?,
+	BeforeFloorMaterial: number,
+	AfterFloorMaterial: number,
+}
+type HistoryEntry =
+	{ Kind: "Placement", Changes: { PlacementChange } }
+	| { Kind: "Floor", Changes: { FloorChange } }
+	| { Kind: "Ceiling", Changes: { CeilingChange } }
+type HistoryState = { Undo: { HistoryEntry }, Redo: { HistoryEntry } }
+
+local Histories: { [Player]: HistoryState } = {}
 
 local function isFiniteNumber(value: any): boolean
 	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -64,6 +84,20 @@ local placeRemote = BuildingRemotes:WaitForChild("Place") :: RemoteFunction
 local removeRemote = BuildingRemotes:WaitForChild("Remove") :: RemoteFunction
 local paintRemote = BuildingRemotes:WaitForChild("Paint") :: RemoteFunction
 local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
+local historyRemote = BuildingRemotes:WaitForChild("History") :: RemoteFunction
+
+local function pushHistory(player: Player, entry: HistoryEntry)
+	local history = Histories[player]
+	if not history then
+		history = { Undo = {}, Redo = {} }
+		Histories[player] = history
+	end
+	table.insert(history.Undo, entry)
+	if #history.Undo > Building.UNDO_HISTORY_LIMIT then
+		table.remove(history.Undo, 1)
+	end
+	table.clear(history.Redo)
+end
 
 --[[Marks a plot's grid dirty so its compressed form is written back to the owner's
 profile (debounced). TODO: wire to DataSaveService profile field + debounce.]]
@@ -289,6 +323,87 @@ local function derenderCeiling(plot, x: number, z: number, floor: number)
 	end
 end
 
+local function explicitFloorMaterial(grid: Grid.Grid, x: number, z: number, floor: number): number
+	local entry = grid:GetFloorEntry(x, z, floor)
+	return if entry then entry.Material else 0
+end
+
+local function copyCeiling(entry: Grid.CeilingEntry?): CeilingState?
+	return if entry then { TopOffset = entry.TopOffset, Material = entry.Material } else nil
+end
+
+-- Applies one compact transaction side directly to the authoritative grid. History is
+-- linear and LIFO, so these states were already validated when originally committed.
+local function applyHistory(plot, entry: HistoryEntry, after: boolean)
+	local grid = plot:GetGrid()
+	if entry.Kind == "Placement" then
+		for _, change in entry.Changes do
+			local shouldExist = if after then change.AfterPresent else change.BeforePresent
+			local id = change.Placement.Id
+			if shouldExist and not grid:GetPlacement(id) then
+				grid:AddPlacement(change.Placement)
+				render(plot, grid:GetPlacement(id))
+			elseif not shouldExist and grid:RemovePlacement(id) then
+				derender(plot, id)
+			end
+		end
+	elseif entry.Kind == "Floor" then
+		local dirtyFloors = {}
+		for _, change in entry.Changes do
+			grid:SetFloorMaterial(
+				change.X,
+				change.Z,
+				change.Floor,
+				if after then change.AfterMaterial else change.BeforeMaterial
+			)
+			dirtyFloors[change.Floor] = true
+		end
+		for floor in dirtyFloors do
+			remeshFloor(plot, floor)
+		end
+	else
+		local dirtyFloors = {}
+		for _, change in entry.Changes do
+			local ceiling = if after then change.AfterCeiling else change.BeforeCeiling
+			if ceiling then
+				grid:SetCeiling(change.X, change.Z, change.Floor, ceiling.TopOffset, ceiling.Material)
+				renderCeiling(plot, change.X, change.Z, change.Floor, ceiling.TopOffset, ceiling.Material)
+			else
+				grid:RemoveCeiling(change.X, change.Z, change.Floor)
+				derenderCeiling(plot, change.X, change.Z, change.Floor)
+			end
+			grid:SetFloorMaterial(
+				change.X,
+				change.Z,
+				change.Floor + 1,
+				if after then change.AfterFloorMaterial else change.BeforeFloorMaterial
+			)
+			dirtyFloors[change.Floor + 1] = true
+		end
+		for floor in dirtyFloors do
+			remeshFloor(plot, floor)
+		end
+	end
+	persist(plot)
+end
+
+local function stepHistory(player: Player, redo: boolean): (boolean, string?)
+	local history = Histories[player]
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not history or not plot then
+		return false, if redo then "nothing to redo" else "nothing to undo"
+	end
+	local source = if redo then history.Redo else history.Undo
+	local target = if redo then history.Undo else history.Redo
+	local entry = table.remove(source)
+	if not entry then
+		return false, if redo then "nothing to redo" else "nothing to undo"
+	end
+	applyHistory(plot, entry, redo)
+	table.insert(target, entry)
+	return true
+end
+
 -- Validates and commits one placement without persisting, so clicks and drags share
 -- exactly one authoritative path.
 local function placeOne(plot, name: string, x: number, z: number, floor: number, rotation: number): (number?, string?)
@@ -329,6 +444,7 @@ function ServerBuildingService:Place(player: Player, name: string, requests: { P
 
 	local placed = 0
 	local firstReason: string? = nil
+	local changes: { PlacementChange } = {}
 	for _, request in requests do
 		local id, reason = placeOne(plot, name, request.X, request.Z, request.Floor, request.Rotation)
 		if not id then
@@ -336,8 +452,13 @@ function ServerBuildingService:Place(player: Player, name: string, requests: { P
 			continue
 		end
 		placed += 1
+		local placement = grid:GetPlacement(id)
+		if placement then
+			table.insert(changes, { Placement = placement, BeforePresent = false, AfterPresent = true })
+		end
 	end
 	if placed > 0 then
+		pushHistory(player, { Kind = "Placement", Changes = changes })
 		persist(plot)
 	end
 	return placed, firstReason
@@ -359,14 +480,21 @@ function ServerBuildingService:Remove(player: Player, placementIds: { number }):
 		return 0
 	end
 	local removed, seen = 0, {}
+	local changes: { PlacementChange } = {}
 	for _, placementId in placementIds do
-		if not seen[placementId] and grid:RemovePlacement(placementId) then
+		if not seen[placementId] then
+			local placement = grid:RemovePlacement(placementId)
 			seen[placementId] = true
+			if not placement then
+				continue
+			end
 			derender(plot, placementId)
+			table.insert(changes, { Placement = placement, BeforePresent = true, AfterPresent = false })
 			removed += 1
 		end
 	end
 	if removed > 0 then
+		pushHistory(player, { Kind = "Placement", Changes = changes })
 		persist(plot)
 	end
 	return removed
@@ -396,6 +524,7 @@ function ServerBuildingService:PaintFloor(
 
 	local painted = 0
 	local seen = {}
+	local changes: { FloorChange } = {}
 	for _, request in requests do
 		local key = `{request.X},{request.Z}`
 		local entry = grid:GetFloorEntry(request.X, request.Z, floor)
@@ -406,11 +535,20 @@ function ServerBuildingService:PaintFloor(
 				else not unchanged and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor))
 		seen[key] = true
 		if valid then
+			local beforeMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor)
 			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex)
+			table.insert(changes, {
+				X = request.X,
+				Z = request.Z,
+				Floor = floor,
+				BeforeMaterial = beforeMaterial,
+				AfterMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor),
+			})
 			painted += 1
 		end
 	end
 	if painted > 0 then
+		pushHistory(player, { Kind = "Floor", Changes = changes })
 		remeshFloor(plot, floor)
 		persist(plot)
 	end
@@ -440,10 +578,22 @@ function ServerBuildingService:PlaceCeiling(
 	end
 
 	local placed = SharedBuildingService:FillCeilings(grid, requests, floor, materialIndex)
+	local changes: { CeilingChange } = {}
 	for _, result in placed do
 		renderCeiling(plot, result.X, result.Z, floor, result.TopOffset, materialIndex)
+		local floorMaterial = explicitFloorMaterial(grid, result.X, result.Z, floor + 1)
+		table.insert(changes, {
+			X = result.X,
+			Z = result.Z,
+			Floor = floor,
+			BeforeCeiling = nil,
+			AfterCeiling = copyCeiling(grid:GetCeiling(result.X, result.Z, floor)),
+			BeforeFloorMaterial = floorMaterial,
+			AfterFloorMaterial = floorMaterial,
+		})
 	end
 	if #placed > 0 then
+		pushHistory(player, { Kind = "Ceiling", Changes = changes })
 		persist(plot)
 	end
 	return #placed, if #placed > 0 then nil else "no available floor cells"
@@ -463,16 +613,29 @@ function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellReq
 		return 0
 	end
 	local removed, seen = 0, {}
+	local changes: { CeilingChange } = {}
 	for _, request in requests do
 		local key = `{request.X},{request.Z}`
-		if not seen[key] and grid:RemoveCeiling(request.X, request.Z, floor) then
+		local ceiling = if not seen[key] then copyCeiling(grid:GetCeiling(request.X, request.Z, floor)) else nil
+		if ceiling and grid:RemoveCeiling(request.X, request.Z, floor) then
+			local floorMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor + 1)
 			grid:SetFloorMaterial(request.X, request.Z, floor + 1, 0)
 			derenderCeiling(plot, request.X, request.Z, floor)
+			table.insert(changes, {
+				X = request.X,
+				Z = request.Z,
+				Floor = floor,
+				BeforeCeiling = ceiling,
+				AfterCeiling = nil,
+				BeforeFloorMaterial = floorMaterial,
+				AfterFloorMaterial = 0,
+			})
 			removed += 1
 		end
 		seen[key] = true
 	end
 	if removed > 0 then
+		pushHistory(player, { Kind = "Ceiling", Changes = changes })
 		remeshFloor(plot, floor + 1)
 		persist(plot)
 	end
@@ -516,5 +679,21 @@ ceilingRemote.OnServerInvoke = function(player, action, target, second, third)
 	end
 	return false
 end
+
+historyRemote.OnServerInvoke = function(player, action)
+	if action == "undo" then
+		return stepHistory(player, false)
+	elseif action == "redo" then
+		return stepHistory(player, true)
+	elseif action == "clear" then
+		Histories[player] = nil
+		return true
+	end
+	return false, "bad request"
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	Histories[player] = nil
+end)
 
 return ServerBuildingService

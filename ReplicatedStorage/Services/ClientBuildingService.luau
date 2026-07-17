@@ -33,6 +33,7 @@ local placeRemote = BuildingRemotes:WaitForChild("Place") :: RemoteFunction
 local removeRemote = BuildingRemotes:WaitForChild("Remove") :: RemoteFunction
 local paintRemote = BuildingRemotes:WaitForChild("Paint") :: RemoteFunction
 local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
+local historyRemote = BuildingRemotes:WaitForChild("History") :: RemoteFunction
 
 local player = Players.LocalPlayer
 
@@ -466,6 +467,11 @@ local function refreshStatus(extra: string?)
 		then (if currentRotation % 2 == 0 then "wall horizontal" else "wall vertical")
 		else `rot {currentRotation * 90}°`
 	statusLabel.Text = `{mode} | level {currentFloor} | {if freeCameraMode then "free cam" else "character cam"} | {rotationText}{if extra then " | " .. extra else ""}`
+end
+
+local function requestHistory(action: "undo" | "redo")
+	local changed, reason = historyRemote:InvokeServer(action)
+	refreshStatus(if changed then action else reason)
 end
 
 local function rotateSelection()
@@ -1252,6 +1258,7 @@ local function setBuildMode(enabled: boolean)
 		syncCameraMode()
 		rebuildPreview()
 	else
+		historyRemote:InvokeServer("clear")
 		dragState = nil
 		deleteDragState = nil
 		freeCameraMode = false
@@ -1306,7 +1313,7 @@ local function buildDebugUI()
 	end
 
 	local tools = Instance.new("Frame")
-	tools.Size = UDim2.new(1, -8, 0, 76)
+	tools.Size = UDim2.new(1, -8, 0, 102)
 	tools.Position = UDim2.fromOffset(4, 46)
 	tools.BackgroundTransparency = 1
 	tools.Parent = panel
@@ -1318,7 +1325,7 @@ local function buildDebugUI()
 
 	local tabs = Instance.new("Frame")
 	tabs.Size = UDim2.new(1, -8, 0, 26)
-	tabs.Position = UDim2.fromOffset(4, 126)
+	tabs.Position = UDim2.fromOffset(4, 152)
 	tabs.BackgroundTransparency = 1
 	tabs.Parent = panel
 
@@ -1341,8 +1348,8 @@ local function buildDebugUI()
 	local function addPage(name: string): ScrollingFrame
 		local page = Instance.new("ScrollingFrame")
 		page.Name = name
-		page.Size = UDim2.new(1, -8, 1, -160)
-		page.Position = UDim2.fromOffset(4, 156)
+		page.Size = UDim2.new(1, -8, 1, -186)
+		page.Position = UDim2.fromOffset(4, 182)
 		page.BackgroundTransparency = 1
 		page.BorderSizePixel = 0
 		page.ScrollBarThickness = 6
@@ -1373,6 +1380,12 @@ local function buildDebugUI()
 
 	addButton(tools, "Rotate", function()
 		rotateSelection()
+	end)
+	addButton(tools, "Undo", function()
+		requestHistory("undo")
+	end)
+	addButton(tools, "Redo", function()
+		requestHistory("redo")
 	end)
 	addButton(tools, "Level -", function()
 		currentFloor = math.max(1, currentFloor - 1)
@@ -1502,6 +1515,15 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	end
 	if not buildMode then
 		return
+	end
+	local controlDown = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+	local shiftDown = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+	if controlDown and input.KeyCode == Enum.KeyCode.Z then
+		requestHistory(if shiftDown then "redo" else "undo")
+	elseif controlDown and input.KeyCode == Enum.KeyCode.Y then
+		requestHistory("redo")
 	elseif input.KeyCode == Enum.KeyCode.R then
 		rotateSelection()
 	elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
