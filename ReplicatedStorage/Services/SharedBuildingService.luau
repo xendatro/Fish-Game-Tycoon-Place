@@ -27,8 +27,9 @@ export type CatalogEntry = {
 	Draggable: ("Line" | "Area")?,
 	-- Footprint in whole cells, derived by measuring the model.
 	Footprint: { Width: number, Depth: number },
-	-- This item's own colour presets, keyed by ITS colour slots. Absent when the item
-	-- only offers its authored default. See SharedColorService.
+	-- Per-slot UI labels ("Pot", "Trunk"), and this item's own colour presets keyed by ITS
+	-- colour slots. See SharedColorService.
+	ColorNames: { string }?,
 	Palettes: { { Name: string, Colors: { [number]: Color3 } } }?,
 	Model: Model?, -- the representative placeable model (nil if not found)
 	ModelSize: Vector3?, -- the representative model's extents (for hitbox sizing)

@@ -165,6 +165,13 @@ function SharedColorService:GetSlots(name: string): { number }
 	return slots
 end
 
+--[[Returns the UI label for one of an asset's colour slots.]]
+function SharedColorService:GetSlotName(name: string, slot: number): string
+	local entry = SharedBuildingService:GetEntry(name)
+	local names = entry and entry.ColorNames
+	return (names and names[slot]) or `Color {slot}`
+end
+
 --[[Returns whether the asset has any recolourable slots.]]
 function SharedColorService:IsColorable(name: string): boolean
 	return defaults[name] ~= nil
@@ -225,6 +232,49 @@ function SharedColorService:Sanitize(name: string, colors: any): SlotMap?
 		end
 	end
 	return if count > 0 then clean else nil
+end
+
+--[[
+Flattens a slot map to {slot, colour, slot, colour, ...}, sorted. Colour maps are sparse
+by nature, and a sparse numeric-keyed table does not survive a datastore round-trip (the
+keys come back as strings), so anything persisted or replicated travels in this form.
+]]
+function SharedColorService.FlattenSlots(colors: SlotMap?): { number }
+	local slots = {}
+	for slot in colors or {} do
+		table.insert(slots, slot)
+	end
+	table.sort(slots)
+
+	local flat = {}
+	for _, slot in slots do
+		table.insert(flat, slot)
+		table.insert(flat, (colors :: SlotMap)[slot])
+	end
+	return flat
+end
+
+--[[Rebuilds a slot map from the flat form. Tolerates a nil or odd-length array.]]
+function SharedColorService.ExpandSlots(flat: { number }?): SlotMap
+	local colors: SlotMap = {}
+	for i = 1, #(flat or {}) - 1, 2 do
+		colors[(flat :: { number })[i]] = (flat :: { number })[i + 1]
+	end
+	return colors
+end
+
+--[[Reads the colours a rendered model is currently wearing, slot by slot.]]
+function SharedColorService:ReadColors(model: Model, name: string): SlotMap
+	local colors: SlotMap = {}
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") then
+			local slot = partSlot(part)
+			if slot and colors[slot] == nil then
+				colors[slot] = SharedColorService.Pack(part.Color)
+			end
+		end
+	end
+	return colors
 end
 
 --[[Returns whether two colour maps describe the same result.]]

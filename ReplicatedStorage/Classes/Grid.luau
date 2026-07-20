@@ -35,11 +35,17 @@ export type Placement = {
 	-- Customised colours, slot -> packed 24-bit colour. Absent slots (and a nil map)
 	-- mean the asset's authored default. See SharedColorService.
 	Colors: { [number]: number }?,
+	-- True when those colours came from the owner's saved palette for this asset rather
+	-- than being picked directly. Purely provenance: Colors stays the render truth, so
+	-- unlinking is just dropping this flag and the object keeps what it's wearing.
+	Linked: boolean?,
 }
 
 -- The compact per-placement tuple actually written to the save (see Compress). The
 -- trailing colour-set index is omitted entirely when the placement is all-default.
-export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot, colorSetIndex?}
+-- {nameIndex, x, z, floor, rot, colorSetIndex?, linked?}. `Palette` here is the catalog
+-- NAME dedupe and predates colours; colours live in ColorSets.
+export type SavedPlacement = { number }
 -- Painted floor material (index into Config.Materials.Floor), per floor + cell. Grass
 -- is implicit on the plot base but stored when explicitly painted on an upper floor.
 -- Color is a packed 24-bit tint, or nil for the material's default (see Config/Materials).
@@ -278,6 +284,7 @@ function Grid:AddPlacement(data: {
 	Cells: { string },
 	Edges: { string },
 	Colors: { [number]: number }?,
+	Linked: boolean?,
 }): number
 	local id = data.Id or self._nextId
 	self._nextId = math.max(self._nextId, id + 1)
@@ -292,6 +299,7 @@ function Grid:AddPlacement(data: {
 		Cells = data.Cells,
 		Edges = data.Edges,
 		Colors = data.Colors,
+		Linked = data.Linked,
 	}
 	self._placements[id] = placement
 
@@ -327,14 +335,16 @@ function Grid:RemovePlacement(id: number): Placement?
 	return placement
 end
 
---[[Sets a placement's custom colours (nil restores the asset's authored defaults).
-Occupancy is unaffected - colour is presentation only. Returns whether it existed.]]
-function Grid:SetPlacementColors(id: number, colors: { [number]: number }?): boolean
+--[[Sets a placement's custom colours (nil restores the asset's authored defaults) and
+whether they came from the owner's saved palette. Occupancy is unaffected - colour is
+presentation only. Returns whether the placement existed.]]
+function Grid:SetPlacementColors(id: number, colors: { [number]: number }?, linked: boolean?): boolean
 	local placement = self._placements[id]
 	if not placement then
 		return false
 	end
 	placement.Colors = colors
+	placement.Linked = linked
 	return true
 end
 
@@ -404,9 +414,16 @@ function Grid:Compress(): SaveBlob
 		end
 
 		local tuple: SavedPlacement = { index, placement.X, placement.Z, placement.Floor, placement.Rotation }
-		local colorSet = colorSetFor(placement.Colors)
-		if colorSet > 0 then
-			tuple[6] = colorSet
+		-- A linked placement's colours are re-derived from the owner's saved palette on
+		-- load, so storing them would only let them go stale. It records the link instead.
+		if placement.Linked then
+			tuple[6] = 0
+			tuple[7] = 1
+		else
+			local colorSet = colorSetFor(placement.Colors)
+			if colorSet > 0 then
+				tuple[6] = colorSet
+			end
 		end
 		table.insert(placements, tuple)
 	end
@@ -475,7 +492,9 @@ function Grid.Decompress(
 		end
 		local x, z, floor, rotation = tuple[2], tuple[3], tuple[4], tuple[5]
 		local cells, edges = resolveFootprint(name, x, z, floor, rotation)
-		-- Saves written before colour customisation simply have no sixth element.
+		-- Saves written before colour customisation simply have no sixth element. Linked
+		-- placements carry no colours here; the caller resolves them from the owner's
+		-- saved palette once it has the profile (the Grid has no access to it).
 		self:AddPlacement({
 			Name = name,
 			X = x,
@@ -484,7 +503,8 @@ function Grid.Decompress(
 			Rotation = rotation,
 			Cells = cells,
 			Edges = edges,
-			Colors = if tuple[6] then colorSets[tuple[6]] else nil,
+			Colors = if tuple[6] and tuple[6] > 0 then colorSets[tuple[6]] else nil,
+			Linked = tuple[7] == 1,
 		})
 	end
 

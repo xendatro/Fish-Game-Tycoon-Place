@@ -25,6 +25,8 @@ local Building = require(ReplicatedStorage.Config.Building)
 local Materials = require(ReplicatedStorage.Config.Materials)
 local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
 local SharedColorService = require(ReplicatedStorage.Services.SharedColorService)
+local DataSaveService = require(ReplicatedStorage.Services.DataSaveService)
+local Signal = require(ReplicatedStorage.Classes.Signal)
 
 local DELETE_FILL_TRANSPARENCY = 0.85
 local DELETE_COLOR = Color3.fromRGB(220, 60, 60)
@@ -39,45 +41,79 @@ local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
 local historyRemote = BuildingRemotes:WaitForChild("History") :: RemoteFunction
 local resetRemote = BuildingRemotes:WaitForChild("Reset") :: RemoteFunction
 local recolorRemote = BuildingRemotes:WaitForChild("Recolor") :: RemoteFunction
+local paletteRemote = BuildingRemotes:WaitForChild("Palette") :: RemoteFunction
 
 local player = Players.LocalPlayer
 
 type PlacementRequest = { X: number, Z: number, Floor: number, Rotation: number }
 type CellRequest = { X: number, Z: number }
 
--- What the Colors page is currently editing. Palettes and slot meanings are per-object,
--- so the page always belongs to exactly one subject: the selected asset, or the selected
--- floor/ceiling material. The recolour tool adopts the subject of whatever you click.
-local colorKind: "Asset" | "Floor" | "Ceiling" = "Asset"
+--[[
+One global colour selection, slot -> packed colour. A slot with no entry means "leave the
+object's authored colour alone", so the same five values work across objects with
+different slot counts. This is both what new placements wear and what the Paint tool
+stamps onto whatever you click.
 
--- The active choice within that subject: one of its palettes (nil = authored default)
--- plus exact per-slot overrides that win over the palette. Floor and ceiling tiles have
--- exactly one colourable surface, so they use slot 1. Both are cleared whenever the
--- subject changes, since a slot number means nothing outside the object that defined it.
-local activePalette: number? = nil
-local slotOverrides: SharedColorService.SlotMap = {}
--- Assigned by the debug UI; called whenever the subject changes.
-local refreshColorPage: () -> () = function() end
+`Linked` is the one exception to "colours are just values": it marks the selection as the
+player's saved palette for `LinkedAsset`, which objects follow through future palette
+edits. Config palettes are stamps by comparison - picking one fills these slots and is
+then forgotten.
+]]
+local PlaceColors: SharedColorService.SlotMap = {}
+local Linked = false
+local LinkedAsset: string? = nil
 
-local function clearColorChoice()
-	activePalette = nil
-	table.clear(slotOverrides)
+ClientBuildingService.PlacementSelected = Signal.new()
+
+function ClientBuildingService:GetPlaceColors(): SharedColorService.SlotMap
+	return table.clone(PlaceColors)
 end
 
---[[The colour map to send for one asset under the current selection.]]
-local function currentColors(name: string): SharedColorService.SlotMap?
-	return SharedColorService:ResolveColors(name, activePalette, slotOverrides)
+function ClientBuildingService:IsLinked(name: string?): boolean
+	return Linked and (name == nil or LinkedAsset == name)
 end
 
---[[The tint to send for a floor/ceiling material. The server drops it if it matches the
-material's default, so "authored default" needs no special case here.]]
-local function currentMaterialColor(kind: "Floor" | "Ceiling", index: number): number?
-	local override = slotOverrides[1]
-	if override then
-		return override
+--[[Replaces the whole selection. `linkedAsset` marks it as that asset's saved palette.]]
+function ClientBuildingService:SetPlaceColors(colors: SharedColorService.SlotMap?, linkedAsset: string?)
+	table.clear(PlaceColors)
+	for slot, packed in colors or {} do
+		PlaceColors[slot] = packed
 	end
-	local palette = activePalette and SharedColorService:MaterialPalettes(kind, index)[activePalette]
-	return if palette then palette.Color else nil
+	Linked = linkedAsset ~= nil
+	LinkedAsset = linkedAsset
+end
+
+--[[Sets one slot (nil clears it). Hand-picking a colour drops any palette link.]]
+function ClientBuildingService:SetPlaceColor(slot: number, packed: number?)
+	PlaceColors[slot] = packed
+	Linked, LinkedAsset = false, nil
+end
+
+--[[Reads the player's saved palette for an asset off the replicated profile.]]
+function ClientBuildingService:GetSavedPalette(name: string): (SharedColorService.SlotMap?, string?)
+	local profile = DataSaveService:GetProfile()
+	local store = profile and profile.Data.CustomPalettes
+	local saved = store and store[name]
+	if not saved then
+		return nil, nil
+	end
+	local plain = if saved.Serialize then saved:Serialize() else saved
+	return SharedColorService:Sanitize(name, SharedColorService.ExpandSlots(plain.Colors)), plain.Name
+end
+
+--[[Asks the server how many placements of an asset exist and how many wear the saved
+palette. Authoritative on purpose - counting the replicated attributes locally races
+replication, and a stale count made the propagate prompt lie about what it would do.]]
+function ClientBuildingService:PaletteInfo(name: string): (number, number)
+	return paletteRemote:InvokeServer("info", name)
+end
+
+--[[The colours to send for one asset: only the slots it actually defines survive.]]
+local function currentColors(name: string): SharedColorService.SlotMap?
+	if Linked and LinkedAsset == name then
+		return (ClientBuildingService:GetSavedPalette(name))
+	end
+	return SharedColorService:Sanitize(name, PlaceColors)
 end
 
 -- Single clicks use the same bulk remote contract as drags.
@@ -85,15 +121,35 @@ function ClientBuildingService:RequestPlace(name: string, x: number, z: number, 
 	local count, reason = placeRemote:InvokeServer(
 		name,
 		{ { X = x, Z = z, Floor = floor, Rotation = rotation } },
-		currentColors(name)
+		currentColors(name),
+		self:IsLinked(name)
 	)
 	return count > 0, reason
 end
 
---[[Requests recolouring an existing placement to the active colour selection.]]
-function ClientBuildingService:RequestRecolor(placementId: number, name: string): (boolean, string?)
-	local count, reason = recolorRemote:InvokeServer({ placementId }, currentColors(name))
-	return count > 0, reason
+--[[Recolours a placement. Succeeds when the server accepted the request, including when
+the object already looked like this - that's a no-op, not a failure.]]
+function ClientBuildingService:RecolorPlacement(
+	placementId: number,
+	colors: SharedColorService.SlotMap?,
+	usePalette: boolean?
+): (boolean, string?)
+	local _, reason = recolorRemote:InvokeServer({ placementId }, colors, usePalette == true)
+	return reason == nil, reason
+end
+
+function ClientBuildingService:SavePalette(
+	name: string,
+	colors: SharedColorService.SlotMap?,
+	propagate: boolean,
+	paletteName: string,
+	placementId: number?
+): (boolean, string?, number)
+	return paletteRemote:InvokeServer("save", name, colors, propagate, paletteName, placementId)
+end
+
+function ClientBuildingService:ApplyPalette(name: string): (number, string?)
+	return paletteRemote:InvokeServer("apply", name)
 end
 
 --[[Requests removal of a placement by id (read from the rendered instance). Returns success.]]
@@ -101,22 +157,23 @@ function ClientBuildingService:RequestRemove(placementId: number): boolean
 	return removeRemote:InvokeServer({ placementId }) > 0
 end
 
+--[[A surface's tint comes from the same global slots: Color 1 is a ceiling underside,
+Color 2 a floor, matching how the Paint tool treats the two faces of one slab.]]
+local function surfaceColor(kind: "Floor" | "Ceiling"): number?
+	return PlaceColors[if kind == "Ceiling" then 1 else 2]
+end
+
 --[[Requests painting a cell's floor material. Material 0 removes an overlay.]]
 function ClientBuildingService:RequestPaint(x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
-	local color = if materialIndex > 0 then currentMaterialColor("Floor", materialIndex) else nil
+	local color = if materialIndex > 0 then surfaceColor("Floor") else nil
 	local count, reason = paintRemote:InvokeServer({ { X = x, Z = z } }, floor, materialIndex, color)
 	return count > 0, reason
 end
 
 --[[Requests placing a ceiling at the top of the selected wall level.]]
 function ClientBuildingService:RequestPlaceCeiling(x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
-	local count, reason = ceilingRemote:InvokeServer(
-		"place",
-		{ { X = x, Z = z } },
-		floor,
-		materialIndex,
-		currentMaterialColor("Ceiling", materialIndex)
-	)
+	local count, reason =
+		ceilingRemote:InvokeServer("place", { { X = x, Z = z } }, floor, materialIndex, surfaceColor("Ceiling"))
 	return count > 0, reason
 end
 
@@ -143,15 +200,14 @@ local paintMode = false
 local paintMaterial = 2 -- floor material index while painting (1 = grass)
 local ceilingMode = false
 local ceilingMaterial = 1 -- ceiling material index while placing ceilings
-local recolorMode = false -- click a built thing to pick it up, then choose a colour
+local paintObjectMode = false -- stamp the current colours onto whatever you click
+local pickMode = false -- read an object's colours into the selection, then go back to paint
 
--- What the recolour tool has picked up. Choosing a colour applies to it immediately, so
--- the flow is pick-object-then-pick-colour rather than pre-arming a colour and hunting.
-type RecolorTarget =
-	{ Kind: "Placement", Id: number, Name: string }
-	| { Kind: "Floor", Cells: { CellRequest }, Floor: number, Index: number }
-	| { Kind: "Ceiling", Cells: { CellRequest }, Floor: number, Index: number }
-local recolorTarget: RecolorTarget? = nil
+-- Everything a paint stroke has swept over, committed in one batch on release.
+type PaintDragState = { Targets: { Instance }, Seen: { [Instance]: boolean } }
+local paintDragState: PaintDragState? = nil
+-- Assigned by the debug UI; rebuilds the Colors tab around the current selection.
+local refreshColorPage: () -> () = function() end
 local statusLabel: TextLabel
 local BuildModeButton: TextButton?
 local CameraModeButton: TextButton?
@@ -193,8 +249,9 @@ local function clearModes()
 	deleteMode = false
 	paintMode = false
 	ceilingMode = false
-	recolorMode = false
-	recolorTarget = nil
+	paintObjectMode = false
+	pickMode = false
+	paintDragState = nil
 end
 
 -- Live preview ("ghost") of the selected asset, following the cursor.
@@ -521,18 +578,16 @@ local function refreshStatus(extra: string?)
 		mode = "BUILD OFF"
 	elseif deleteMode then
 		mode = "DELETE"
-	elseif recolorMode then
-		local target = recolorTarget
-		mode = if not target
-			then "Recolour: click something"
-			elseif target.Kind == "Placement" then `Recolour: {target.Name}`
-			else `Recolour: {Materials[target.Kind][target.Index].Material}`
+	elseif pickMode then
+		mode = "PICK"
+	elseif paintObjectMode then
+		mode = "PAINT"
 	elseif paintMode then
-		mode = `Paint: {Materials.Floor[paintMaterial].Material}`
+		mode = `Floor: {Materials.Floor[paintMaterial].Material}`
 	elseif ceilingMode then
 		mode = `Ceiling: {Materials.Ceiling[ceilingMaterial].Material}`
 	else
-		mode = `Place: {selectedAsset or "none"}`
+		mode = `Place: {selectedAsset or "none"}{if Linked then " (my palette)" else ""}`
 	end
 	if BuildModeButton then
 		BuildModeButton.Text = if buildMode then "Build: ON" else "Build: OFF"
@@ -825,10 +880,10 @@ local function updateDeleteHighlight()
 end
 
 --[[
-Returns the instance under the cursor the recolour tool can act on: a colourable
-placement, a ceiling slab, or a painted floor tile. Anything else is nil.
+Returns the instance under the cursor a colour tool can act on: a colourable placement, a
+ceiling slab, or a painted floor tile.
 ]]
-local function recolorHover(): Instance?
+local function colorHover(): Instance?
 	local target = (deleteRaycast())
 	local model = findPlacementModel(target)
 	if model then
@@ -842,11 +897,10 @@ local function recolorHover(): Instance?
 	return if target and target:GetAttribute("FloorLevel") then target else nil
 end
 
---[[Outlines whatever the recolour tool would pick up.]]
-local function updateRecolorHover()
+local function updateColorHover()
 	hideTilePreview()
 	hideIndicators()
-	local target = recolorHover()
+	local target = colorHover()
 	if target then
 		setDeleteHighlights({ target :: any }, RECOLOR_COLOR)
 	else
@@ -925,7 +979,7 @@ local function rebuildPreview()
 	end
 	table.clear(extraPreviewModels)
 
-	if not buildMode or deleteMode or paintMode or ceilingMode or recolorMode or not selectedAsset then
+	if not buildMode or deleteMode or paintMode or ceilingMode or paintObjectMode or pickMode or not selectedAsset then
 		return
 	end
 
@@ -1130,88 +1184,152 @@ local function updatePreview()
 end
 
 --[[
-Picks up whatever the recolour tool is pointing at and makes it the Colors page's subject:
-its palettes and slots, starting from its authored default. Choosing a colour then applies
-to it immediately (see applyRecolor).
+Stamps the global colour selection onto whatever was clicked. A placement takes the slots
+it defines; a floor tile or ceiling slab is treated as one divider, taking Color 1 on its
+ceiling underside and Color 2 on the floor above it.
 ]]
-local function pickRecolorTarget()
-	local target = recolorHover()
+--[[
+Paint accumulates everything the cursor sweeps over while held, then commits once on
+release. An ordinary click is just a drag that never moved, so there's one path.
+]]
+local function addPaintTarget()
+	local state = paintDragState
+	local target = colorHover()
+	if not state or not target or state.Seen[target] then
+		return
+	end
+	state.Seen[target] = true
+	table.insert(state.Targets, target)
+end
+
+local function beginPaintDrag()
+	paintDragState = { Targets = {}, Seen = {} }
+	addPaintTarget()
+end
+
+local function updatePaintDrag()
+	hideTilePreview()
+	hideIndicators()
+	addPaintTarget()
+	setDeleteHighlights((paintDragState :: PaintDragState).Targets :: any, RECOLOR_COLOR)
+end
+
+local function finishPaintDrag()
+	local state = paintDragState
+	paintDragState = nil
+	hideDeleteHighlight()
+	if not state or #state.Targets == 0 then
+		refreshStatus("nothing colourable there")
+		return
+	end
+
+	local base = getMyPlotBase()
+	local grid = base and Grid.new(base)
+	local placementIds = {}
+	-- Surface cells grouped by divider level, since one call covers one level.
+	local surfaces: { [number]: { CellRequest } } = {}
+	local seenCells = {}
+
+	local function addCell(ceilingFloor: number, x: number, z: number)
+		local key = `{ceilingFloor}:{x},{z}`
+		if seenCells[key] then
+			return
+		end
+		seenCells[key] = true
+		surfaces[ceilingFloor] = surfaces[ceilingFloor] or {}
+		table.insert(surfaces[ceilingFloor], { X = x, Z = z })
+	end
+
+	for _, target in state.Targets do
+		if target:IsA("Model") then
+			table.insert(placementIds, target:GetAttribute("PlacementId"))
+		elseif target:GetAttribute("TopOffset") ~= nil then
+			addCell(
+				target:GetAttribute("Floor") :: number,
+				target:GetAttribute("GridX") :: number,
+				target:GetAttribute("GridZ") :: number
+			)
+		elseif grid then
+			local ceilingFloor = (target:GetAttribute("FloorLevel") :: number) - 1
+			for _, cell in floorCellsOfPart(grid, target :: BasePart) do
+				addCell(ceilingFloor, cell.X, cell.Z)
+			end
+		end
+	end
+
+	-- Colours go unsanitised: the server sanitises per placement, so one sweep can cover
+	-- several asset types at once.
+	local painted, failure = 0, nil
+	if #placementIds > 0 then
+		local count, reason = recolorRemote:InvokeServer(placementIds, PlaceColors, false)
+		painted += count
+		failure = failure or reason
+	end
+	for ceilingFloor, cells in surfaces do
+		local count, reason = ceilingRemote:InvokeServer("surface", cells, ceilingFloor, PlaceColors)
+		painted += count
+		failure = failure or reason
+	end
+	refreshStatus(if failure then `rejected: {failure}` else `painted {painted}`)
+end
+
+--[[
+Reads every colour off whatever was clicked and makes it the current selection. A
+placement gives up the slots it defines; a floor or ceiling gives Color 1 from the ceiling
+underside and Color 2 from the floor above, matching how the Paint tool writes them back.
+]]
+local function pickTarget()
+	local target = colorHover()
 	if not target then
 		refreshStatus("nothing colourable there")
 		return
 	end
-	clearColorChoice()
 
+	local picked: SharedColorService.SlotMap
 	if target:IsA("Model") then
 		local name = target:GetAttribute("AssetName") :: string
-		recolorTarget = { Kind = "Placement", Id = target:GetAttribute("PlacementId") :: number, Name = name }
-		selectedAsset, colorKind = name, "Asset"
-	elseif target:GetAttribute("TopOffset") ~= nil then
-		local index = target:GetAttribute("MaterialIndex") :: number
-		recolorTarget = {
-			Kind = "Ceiling",
-			Cells = { { X = target:GetAttribute("GridX") :: number, Z = target:GetAttribute("GridZ") :: number } },
-			Floor = target:GetAttribute("Floor") :: number,
-			Index = index,
-		}
-		ceilingMaterial, colorKind = index, "Ceiling"
+		picked = SharedColorService:ReadColors(target, name)
 	else
 		local base = getMyPlotBase()
-		if not base then
-			refreshStatus("no owned plot")
-			return
+		local plot = base and base.Parent
+		local ceilingFloor, cellX, cellZ
+		if target:GetAttribute("TopOffset") ~= nil then
+			ceilingFloor = target:GetAttribute("Floor") :: number
+			cellX, cellZ = target:GetAttribute("GridX") :: number, target:GetAttribute("GridZ") :: number
+		else
+			ceilingFloor = (target:GetAttribute("FloorLevel") :: number) - 1
+			local x, z = Grid.new(base :: BasePart):WorldToCell((target :: BasePart).Position)
+			cellX, cellZ = x, z
 		end
-		local index = target:GetAttribute("MaterialIndex") :: number
-		recolorTarget = {
-			Kind = "Floor",
-			Cells = floorCellsOfPart(Grid.new(base), target :: BasePart),
-			Floor = target:GetAttribute("FloorLevel") :: number,
-			Index = index,
-		}
-		paintMaterial, colorKind = index, "Floor"
+
+		-- Read the partner face off the rendered instances so picking one surface fills
+		-- both slots, the same pair the Paint tool would write.
+		picked = {}
+		local ceilings = plot and plot:FindFirstChild("Ceilings")
+		local slab = ceilings and ceilings:FindFirstChild(Grid.ceilingKey(cellX, cellZ, ceilingFloor))
+		if slab then
+			picked[1] = SharedColorService.Pack((slab :: BasePart).Color)
+		end
+		local floors = plot and plot:FindFirstChild("Floor")
+		local tile = base and floorPartAt(floors, Grid.new(base), cellX, cellZ, ceilingFloor + 1)
+		if tile then
+			picked[2] = SharedColorService.Pack(tile.Color)
+		end
 	end
 
+	ClientBuildingService:SetPlaceColors(picked, nil)
 	refreshColorPage()
-	refreshStatus("picked up - choose a colour")
-end
-
---[[Applies the current colour choice to the picked-up target. Floors reuse the paint
-path (a recolour is a repaint with the same material), ceilings their own recolour action.]]
-local function applyRecolor()
-	local target = recolorTarget
-	if not recolorMode or not target then
-		return
-	end
-
-	local ok, reason
-	if target.Kind == "Placement" then
-		ok, reason = ClientBuildingService:RequestRecolor(target.Id, target.Name)
-	elseif target.Kind == "Floor" then
-		local count, why = paintRemote:InvokeServer(
-			target.Cells,
-			target.Floor,
-			target.Index,
-			currentMaterialColor("Floor", target.Index)
-		)
-		ok, reason = count > 0, why
-	else
-		local count, why = ceilingRemote:InvokeServer(
-			"recolor",
-			target.Cells,
-			target.Floor,
-			currentMaterialColor("Ceiling", target.Index)
-		)
-		ok, reason = count > 0, why
-	end
-	refreshStatus(if ok then "recoloured" else `rejected: {reason}`)
+	-- Eyedropper convention: hand the brush straight back.
+	pickMode, paintObjectMode = false, true
+	refreshStatus("picked colours")
 end
 
 local function onClick()
 	if not buildMode then
 		return
 	end
-	if recolorMode then
-		pickRecolorTarget()
+	if pickMode then
+		pickTarget()
 		return
 	end
 	-- Delete mode prioritises rendered placements/ceilings under the cursor. A rendered
@@ -1251,8 +1369,16 @@ local function onClick()
 		return
 	end
 
+	-- Nothing active: clicking a placeable selects it, which is what opens the item panel.
 	if not paintMode and not ceilingMode and not selectedAsset then
-		refreshStatus("select an asset first")
+		local model = findPlacementModel((deleteRaycast()))
+		if model then
+			ClientBuildingService.PlacementSelected:Fire(model)
+			refreshStatus(`selected {model:GetAttribute("AssetName")}`)
+		else
+			ClientBuildingService.PlacementSelected:Fire(nil)
+			refreshStatus("select an asset first")
+		end
 		return
 	end
 
@@ -1392,7 +1518,7 @@ end
 --[[Starts a configured item drag, or an area drag for the floor/ceiling tools. A
 non-draggable catalog item returns false so the caller can use normal click placement.]]
 local function beginDrag(): boolean
-	if not buildMode or deleteMode or recolorMode then
+	if not buildMode or deleteMode or paintObjectMode or pickMode then
 		return false
 	end
 	local entry = selectedAsset and SharedBuildingService:GetEntry(selectedAsset)
@@ -1444,16 +1570,22 @@ local function finishDrag()
 
 	if state.Mode == "Item" then
 		local requests = dragPlacements(state, state.LastX, state.LastZ)
-		local placed, reason = placeRemote:InvokeServer(state.Name, requests, currentColors(state.Name))
+		local placed, reason =
+			placeRemote:InvokeServer(
+				state.Name,
+				requests,
+				currentColors(state.Name),
+				ClientBuildingService:IsLinked(state.Name)
+			)
 		refreshStatus(if placed > 0 then `placed {placed}/{#requests}` else `rejected: {reason}`)
 	else
 		local requests = rectangleCells(state.StartX, state.StartZ, state.LastX, state.LastZ)
 		if state.Mode == "Paint" then
-			local color = currentMaterialColor("Floor", state.Material)
+			local color = surfaceColor("Floor")
 			local painted, reason = paintRemote:InvokeServer(requests, state.Floor, state.Material, color)
 			refreshStatus(if painted > 0 then `painted {painted}/{#requests}` else `rejected: {reason}`)
 		else
-			local color = currentMaterialColor("Ceiling", state.Material)
+			local color = surfaceColor("Ceiling")
 			local placed, reason = ceilingRemote:InvokeServer("place", requests, state.Floor, state.Material, color)
 			refreshStatus(if placed > 0 then `ceiling {placed}/{#requests}` else `rejected: {reason}`)
 		end
@@ -1479,6 +1611,7 @@ local function setBuildMode(enabled: boolean)
 		historyRemote:InvokeServer("clear")
 		dragState = nil
 		deleteDragState = nil
+		paintDragState = nil
 		freeCameraMode = false
 		cameraController:SetEnabled(false)
 		if previewModel then
@@ -1531,7 +1664,7 @@ local function buildDebugUI()
 	end
 
 	local tools = Instance.new("Frame")
-	tools.Size = UDim2.new(1, -8, 0, 154)
+	tools.Size = UDim2.new(1, -8, 0, 180)
 	tools.Position = UDim2.fromOffset(4, 46)
 	tools.BackgroundTransparency = 1
 	tools.Parent = panel
@@ -1543,7 +1676,7 @@ local function buildDebugUI()
 
 	local tabs = Instance.new("Frame")
 	tabs.Size = UDim2.new(1, -8, 0, 26)
-	tabs.Position = UDim2.fromOffset(4, 204)
+	tabs.Position = UDim2.fromOffset(4, 230)
 	tabs.BackgroundTransparency = 1
 	tabs.Parent = panel
 
@@ -1566,8 +1699,8 @@ local function buildDebugUI()
 	local function addPage(name: string): ScrollingFrame
 		local page = Instance.new("ScrollingFrame")
 		page.Name = name
-		page.Size = UDim2.new(1, -8, 1, -238)
-		page.Position = UDim2.fromOffset(4, 234)
+		page.Size = UDim2.new(1, -8, 1, -264)
+		page.Position = UDim2.fromOffset(4, 260)
 		page.BackgroundTransparency = 1
 		page.BorderSizePixel = 0
 		page.ScrollBarThickness = 6
@@ -1655,10 +1788,20 @@ local function buildDebugUI()
 		rebuildPreview()
 		refreshStatus()
 	end)
-	addButton(tools, "Recolor", function()
-		local wasRecolor = recolorMode
+	addButton(tools, "Paint", function()
+		local wasPaint = paintObjectMode
 		clearModes()
-		recolorMode = not wasRecolor
+		selectedAsset = nil
+		paintObjectMode = not wasPaint
+		refreshColorPage()
+		rebuildPreview()
+		refreshStatus()
+	end)
+	addButton(tools, "Pick", function()
+		local wasPick = pickMode
+		clearModes()
+		selectedAsset = nil
+		pickMode = not wasPick
 		rebuildPreview()
 		refreshStatus()
 	end)
@@ -1692,13 +1835,12 @@ local function buildDebugUI()
 	local function addAssets(page: ScrollingFrame, names: { string })
 		table.sort(names)
 		for _, name in names do
+			-- Re-clicking the selected asset deselects it, which is how you reach the
+			-- neutral state where clicking a placeable opens its panel.
 			addButton(page, name, function()
+				local wasSelected = selectedAsset == name
 				clearModes()
-				selectedAsset = name
-				-- Slot numbers mean different things per object, so a carried-over
-				-- palette or override would be nonsense on the new subject.
-				clearColorChoice()
-				colorKind = "Asset"
+				selectedAsset = if wasSelected then nil else name
 				refreshColorPage()
 				rebuildPreview()
 				refreshStatus()
@@ -1719,8 +1861,6 @@ local function buildDebugUI()
 			clearModes()
 			ceilingMode = true
 			ceilingMaterial = index
-			clearColorChoice()
-			colorKind = "Ceiling"
 			refreshColorPage()
 			rebuildPreview()
 			refreshStatus()
@@ -1732,8 +1872,6 @@ local function buildDebugUI()
 			clearModes()
 			paintMode = true
 			paintMaterial = index
-			clearColorChoice()
-			colorKind = "Floor"
 			refreshColorPage()
 			rebuildPreview()
 			refreshStatus()
@@ -1758,61 +1896,24 @@ local function buildDebugUI()
 		return SharedColorService.Pack(Color3.fromRGB(r, g, b))
 	end
 
-	--[[
-	The subject the Colors page is editing right now, flattened to the two things the page
-	actually needs: an ordered slot list, and palettes expressed as slot maps. Floor and
-	ceiling materials have a single surface, so they present as one slot-1 entry.
-	]]
-	local function colorSubject(): ({ number }, { { Name: string, Colors: SharedColorService.SlotMap } }, string?)
-		if colorKind == "Asset" then
-			local name = selectedAsset
-			if not name then
-				return {}, {}, "Pick an asset to colour it"
-			end
-			if not SharedColorService:IsColorable(name) then
-				return {}, {}, `{name} has no Color tags`
-			end
-			return SharedColorService:GetSlots(name), SharedColorService:GetPalettes(name), nil
-		end
-
-		local index = if colorKind == "Floor" then paintMaterial else ceilingMaterial
-		local palettes = {}
-		for _, palette in SharedColorService:MaterialPalettes(colorKind, index) do
-			table.insert(palettes, { Name = palette.Name, Colors = { [1] = palette.Color } })
-		end
-		return { 1 }, palettes, nil
-	end
-
+	-- The Colors page edits the one global selection: always all five slots, unlabelled.
+	-- Per-object slot names ("Pot", "Trunk") belong to the item panel, where you can see
+	-- which object they apply to.
 	local slotBoxes: { [number]: TextBox } = {}
 
 	local function refreshSlots()
-		local _, palettes = colorSubject()
-		local palette = activePalette and palettes[activePalette]
+		local colors = ClientBuildingService:GetPlaceColors()
 		for slot, box in slotBoxes do
-			local override = slotOverrides[slot]
-			local packed = override or (palette and palette.Colors[slot])
+			local packed = colors[slot]
 			local color = if packed then SharedColorService.Unpack(packed) else Color3.fromRGB(45, 45, 45)
 			box.BackgroundColor3 = color
-			-- Flip the label to dark on light swatches so it stays readable.
 			local luminance = color.R * 0.299 + color.G * 0.587 + color.B * 0.114
 			box.TextColor3 = if packed and luminance > 0.55 then Color3.new() else Color3.new(1, 1, 1)
-			local source = if override then "exact" elseif packed then "palette" else "default"
-			box.PlaceholderText = `Color{slot}  ({source})`
 		end
 		rebuildPreview()
 		refreshStatus()
 	end
 
-	--[[Redraws the swatches AND pushes the choice to a picked-up recolour target. Only
-	deliberate colour choices call this - rebuilding the page must not, or merely picking
-	an object up would immediately reset it to its default.]]
-	local function commitColorChoice()
-		refreshSlots()
-		applyRecolor()
-	end
-
-	--[[Rebuilds the page around the current subject. Thrown away whenever the subject
-	changes, since another object's palettes and slot numbers wouldn't mean the same thing.]]
 	refreshColorPage = function()
 		for _, child in colorPage:GetChildren() do
 			if not child:IsA("UIListLayout") then
@@ -1821,43 +1922,66 @@ local function buildDebugUI()
 		end
 		table.clear(slotBoxes)
 
-		local slots, palettes, notice = colorSubject()
-		if notice then
-			addNotice(colorPage, notice)
-			return
-		end
+		local name = selectedAsset
 
-		addButton(colorPage, "Default", function()
-			clearColorChoice()
+		addButton(colorPage, "Reset To Default", function()
+			ClientBuildingService:SetPlaceColors(nil, nil)
 			refreshColorPage()
-			applyRecolor()
 		end)
-		for index, palette in palettes do
-			addButton(colorPage, palette.Name, function()
-				activePalette = index
-				commitColorChoice()
-			end)
+
+		if name and SharedColorService:IsColorable(name) then
+			-- Config palettes stamp their colours into the slots and are then forgotten.
+			for _, palette in SharedColorService:GetPalettes(name) do
+				addButton(colorPage, palette.Name, function()
+					ClientBuildingService:SetPlaceColors(palette.Colors, nil)
+					refreshColorPage()
+				end)
+			end
+			-- The saved palette stays a live link so future edits can propagate.
+			local saved, savedName = ClientBuildingService:GetSavedPalette(name)
+			if saved then
+				addButton(colorPage, `Use "{savedName}" (linked)`, function()
+					ClientBuildingService:SetPlaceColors(saved, name)
+					refreshColorPage()
+				end)
+			end
 		end
 
-		for _, slot in slots do
+		for slot = 1, Building.COLOR_SLOTS do
+			local row = Instance.new("Frame")
+			row.Size = UDim2.new(1, -8, 0, 24)
+			row.BackgroundTransparency = 1
+			row.Parent = colorPage
+
+			local label = Instance.new("TextLabel")
+			label.Size = UDim2.new(0.45, 0, 1, 0)
+			label.BackgroundTransparency = 1
+			label.TextColor3 = Color3.new(1, 1, 1)
+			label.TextXAlignment = Enum.TextXAlignment.Left
+			label.Text = `Color {slot}`
+			label.Parent = row
+
 			local box = Instance.new("TextBox")
-			box.Size = UDim2.new(1, -8, 0, 24)
+			box.Size = UDim2.new(0.55, 0, 1, 0)
+			box.Position = UDim2.new(0.45, 0, 0, 0)
 			box.BorderSizePixel = 0
 			box.ClearTextOnFocus = false
+			box.PlaceholderText = "#rrggbb"
 			box.Text = ""
-			box.Parent = colorPage
+			box.Parent = row
 			slotBoxes[slot] = box
 
 			box.FocusLost:Connect(function()
 				local packed = parseColor(box.Text)
-				slotOverrides[slot] = packed
+				ClientBuildingService:SetPlaceColor(slot, packed)
 				if not packed then
 					box.Text = ""
 				end
-				commitColorChoice()
+				refreshSlots()
 			end)
 		end
-		addNotice(colorPage, "Type 255,128,0 or #ff8000. Empty = palette, or default.")
+
+		addNotice(colorPage, "255,128,0 or #ff8000. Empty = keep the object's own colour.")
 		refreshSlots()
 	end
 
@@ -1884,9 +2008,13 @@ RunService.RenderStepped:Connect(function()
 			end
 		end
 	end
-	if recolorMode then
+	if paintObjectMode or pickMode then
 		hideBuildPlane()
-		updateRecolorHover()
+		if paintDragState then
+			updatePaintDrag()
+		else
+			updateColorHover()
+		end
 	elseif deleteMode then
 		-- Hover targets real objects; an active drag can optionally show one stable grid plane.
 		if not deleteDragState then
@@ -1921,6 +2049,8 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 			if not beginDeleteDrag() then
 				onClick()
 			end
+		elseif paintObjectMode then
+			beginPaintDrag()
 		elseif not beginDrag() then
 			onClick()
 		end
@@ -1929,7 +2059,9 @@ end)
 
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		if deleteDragState then
+		if paintDragState then
+			finishPaintDrag()
+		elseif deleteDragState then
 			finishDeleteDrag()
 		else
 			finishDrag()
