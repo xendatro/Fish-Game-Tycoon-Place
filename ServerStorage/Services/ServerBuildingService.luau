@@ -125,7 +125,7 @@ end
 
 --[[
 Renders a committed placement on the server (so it replicates to everyone). Clones the
-asset model, rotates it, and rests it on the plot's floor surface at its pivot cell.
+asset model, rotates it, and aligns it to its floor or ceiling surface at its pivot cell.
 
 This is the basic content path. Each level has a deterministic configured offset;
 ceilings and flooring use their own render paths below.
@@ -146,11 +146,18 @@ local function render(plot, placement)
 	clone:SetAttribute("Floor", placement.Floor)
 	clone:SetAttribute("Rotation", placement.Rotation)
 
-	-- First place it on the correct X/Z edge or cell, then bottom-align its actual bounds
-	-- to the level surface. Model pivots are not required to be centred.
+	-- First place it on the correct X/Z edge or cell, then align its actual bounds to the
+	-- supporting surface. Model pivots are not required to be centred.
 	local groundCF = SharedBuildingService:GetPlacementCFrame(grid, placement.Name, placement.X, placement.Z, placement.Rotation)
 	if groundCF then
-		SharedBuildingService:PivotModelToLevel(clone, groundCF, grid.Origin.Y, placement.Floor)
+		local entry = SharedBuildingService:GetEntry(placement.Name)
+		SharedBuildingService:PivotModelToLevel(
+			clone,
+			groundCF,
+			grid.Origin.Y,
+			placement.Floor,
+			entry and entry.Type
+		)
 	end
 
 	clone.Parent = getBuildContainer(plot)
@@ -682,7 +689,11 @@ function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellReq
 	for _, request in requests do
 		local key = `{request.X},{request.Z}`
 		local ceiling = if not seen[key] then copyCeiling(grid:GetCeiling(request.X, request.Z, floor)) else nil
-		if ceiling and grid:RemoveCeiling(request.X, request.Z, floor) then
+		local occupantId = grid:GetCellOccupant(request.X, request.Z, floor)
+		local occupant = occupantId and grid:GetPlacement(occupantId)
+		local occupantEntry = occupant and SharedBuildingService:GetEntry(occupant.Name)
+		local supportsHanger = occupantEntry and occupantEntry.Type == "Hanger"
+		if ceiling and not supportsHanger and grid:RemoveCeiling(request.X, request.Z, floor) then
 			local floorMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor + 1)
 			grid:SetFloorMaterial(request.X, request.Z, floor + 1, 0)
 			derenderCeiling(plot, request.X, request.Z, floor)

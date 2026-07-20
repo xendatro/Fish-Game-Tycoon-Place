@@ -19,9 +19,10 @@ local Grid = require(ReplicatedStorage.Classes.Grid)
 
 local SharedBuildingService = {}
 
+export type ItemType = "Content" | "Wall" | "Ceiling" | "Hanger"
 export type CatalogEntry = {
 	Name: string,
-	Type: "Content" | "Wall" | "Ceiling" | "Hanger",
+	Type: ItemType,
 	-- Line follows the item's authored length; Area fills an X/Z footprint lattice.
 	Draggable: ("Line" | "Area")?,
 	-- Footprint in whole cells, derived by measuring the model.
@@ -320,14 +321,27 @@ function SharedBuildingService:CanPaintFloor(grid: Grid.Grid, x: number, z: numb
 	return true
 end
 
---[[Places a model horizontally, then shifts it vertically until its actual bounding-box
-bottom rests exactly on the selected level. This works with any authored model pivot.]]
-function SharedBuildingService:PivotModelToLevel(model: Model, placementCFrame: CFrame, originY: number, floor: number)
+--[[Places a model horizontally, then shifts it vertically using its actual bounding box.
+Hangers attach their top to the underside of the selected level's ceiling slab; every
+other item rests its bottom on the selected level. This works with any authored pivot.]]
+function SharedBuildingService:PivotModelToLevel(
+	model: Model,
+	placementCFrame: CFrame,
+	originY: number,
+	floor: number,
+	itemType: ItemType?
+)
 	model:PivotTo(placementCFrame)
 	local boundingCFrame, boundingSize = model:GetBoundingBox()
-	local bottomY = boundingCFrame.Position.Y - boundingSize.Y / 2
-	local baseY = originY + self:GetLevelBaseOffset(floor)
-	model:PivotTo(model:GetPivot() + Vector3.new(0, baseY - bottomY, 0))
+	local modelEdgeY = boundingCFrame.Position.Y
+	local targetY = originY + self:GetLevelBaseOffset(floor)
+	if itemType == "Hanger" then
+		modelEdgeY += boundingSize.Y / 2
+		targetY = originY + self:GetLevelTopOffset(floor) - Building.CEILING_THICKNESS
+	else
+		modelEdgeY -= boundingSize.Y / 2
+	end
+	model:PivotTo(model:GetPivot() + Vector3.new(0, targetY - modelEdgeY, 0))
 end
 
 --[[Adds every available member of a floor-slab selection to the supplied grid. Slabs
@@ -381,6 +395,9 @@ function SharedBuildingService:GetHitboxPieces(
 	local h = modelSize.Y
 	local origin = grid.Origin
 	local floorOffset = self:GetLevelBaseOffset(floor)
+	local contentCentreY = if entry.Type == "Hanger"
+		then origin.Y + self:GetLevelTopOffset(floor) - Building.CEILING_THICKNESS - h / 2
+		else origin.Y + floorOffset + h / 2
 	local yaw = math.rad(-90 * rotation)
 	local pieces: { HitboxPiece } = {}
 
@@ -415,7 +432,7 @@ function SharedBuildingService:GetHitboxPieces(
 		for _, coord in computeCellCoords(entry, x, z, rotation) do
 			local centre = grid:GetCellCenter(coord[1], coord[2])
 			table.insert(pieces, {
-				CFrame = CFrame.new(centre.X, origin.Y + floorOffset + h / 2, centre.Z),
+				CFrame = CFrame.new(centre.X, contentCentreY, centre.Z),
 				Size = Vector3.new(cell, h, cell),
 				InBounds = grid:IsInBounds(coord[1], coord[2]),
 				Key = Grid.cellKey(coord[1], coord[2], floor),
@@ -461,8 +478,15 @@ function SharedBuildingService:CanPlace(
 			return false, "out of bounds"
 		end
 	end
+	-- Hangers attach to the underside of every ceiling tile covered by their footprint.
+	if entry.Type == "Hanger" then
+		for _, coord in computeCellCoords(entry, x, z, rotation) do
+			if not grid:GetCeiling(coord[1], coord[2], floor) then
+				return false, "needs ceiling above"
+			end
+		end
 	-- Structural pieces may float; ordinary content must rest on a slab below.
-	if floor > 1 and entry.Type ~= "Wall" and entry.Type ~= "Floor" then
+	elseif floor > 1 and entry.Type ~= "Wall" and entry.Type ~= "Floor" then
 		for _, coord in computeCellCoords(entry, x, z, rotation) do
 			if not grid:GetCeiling(coord[1], coord[2], floor - 1) then
 				return false, "needs ceiling below"
@@ -478,7 +502,6 @@ function SharedBuildingService:CanPlace(
 	end
 
 	-- TODO(doc rules):
-	--   * Hangers must attach beneath a ceiling.
 	--   * NPC-interactable assets need >= 1 empty clearance cell.
 	--   * Walls cannot be penetrated by content (edge-vs-cell adjacency check).
 	--   * Money check happens server-side in ServerBuildingService.

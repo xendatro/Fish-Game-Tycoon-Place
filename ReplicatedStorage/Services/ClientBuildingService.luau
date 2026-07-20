@@ -976,7 +976,14 @@ local function updatePreview()
 				request.Rotation
 			)
 			if model and groundCF then
-				SharedBuildingService:PivotModelToLevel(model, groundCF, grid.Origin.Y, request.Floor)
+				local entry = SharedBuildingService:GetEntry(name)
+				SharedBuildingService:PivotModelToLevel(
+					model,
+					groundCF,
+					grid.Origin.Y,
+					request.Floor,
+					entry and entry.Type
+				)
 			end
 		end
 		for index = #requests, #extraPreviewModels do

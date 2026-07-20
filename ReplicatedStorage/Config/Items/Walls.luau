@@ -1,5 +1,5 @@
 return {
-	Wall = {
+	--[[Wall = {
 		Type = "Wall",
 	},
 	
@@ -13,7 +13,7 @@ return {
 	
 	DoubleDoor = {
 		Type = "Wall",
-	},
+	},]]
 	
 	TestWall = {
 		Type = "Wall",
