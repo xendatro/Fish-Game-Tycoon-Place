@@ -27,6 +27,9 @@ export type CatalogEntry = {
 	Draggable: ("Line" | "Area")?,
 	-- Footprint in whole cells, derived by measuring the model.
 	Footprint: { Width: number, Depth: number },
+	-- This item's own colour presets, keyed by ITS colour slots. Absent when the item
+	-- only offers its authored default. See SharedColorService.
+	Palettes: { { Name: string, Colors: { [number]: Color3 } } }?,
 	Model: Model?, -- the representative placeable model (nil if not found)
 	ModelSize: Vector3?, -- the representative model's extents (for hitbox sizing)
 }
@@ -350,14 +353,15 @@ function SharedBuildingService:FillCeilings(
 	grid: Grid.Grid,
 	cells: { { X: number, Z: number } },
 	floor: number,
-	material: number
+	material: number,
+	color: number?
 ): { { Index: number, X: number, Z: number, TopOffset: number } }
 	local placed, seen = {}, {}
 	local topOffset = self:GetLevelTopOffset(floor)
 	for index, cell in cells do
 		local key = `{cell.X},{cell.Z}`
 		if not seen[key] and grid:IsInBounds(cell.X, cell.Z) and not grid:GetCeiling(cell.X, cell.Z, floor) then
-			grid:SetCeiling(cell.X, cell.Z, floor, topOffset, material)
+			grid:SetCeiling(cell.X, cell.Z, floor, topOffset, material, color)
 			table.insert(placed, { Index = index, X = cell.X, Z = cell.Z, TopOffset = topOffset })
 		end
 		seen[key] = true

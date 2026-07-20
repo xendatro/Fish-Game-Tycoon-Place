@@ -12,6 +12,7 @@ return {
 	},
 	Build = {
 		Palette = {},
+		ColorSets = {},
 		Placements = {},
 		Floors = {},
 		Ceilings = {},

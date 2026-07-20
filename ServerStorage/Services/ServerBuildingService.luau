@@ -15,6 +15,7 @@ local ServerStorage = game:GetService("ServerStorage")
 local Players = game:GetService("Players")
 
 local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
+local SharedColorService = require(ReplicatedStorage.Services.SharedColorService)
 local DataSaveService = require(ReplicatedStorage.Services.DataSaveService)
 local ServerPlotService = require(ServerStorage.Services.ServerPlotService)
 local Building = require(ReplicatedStorage.Config.Building)
@@ -26,21 +27,25 @@ local ServerBuildingService = {}
 type PlacementRequest = { X: number, Z: number, Floor: number, Rotation: number }
 type CellRequest = { X: number, Z: number }
 type PlacementChange = { Placement: Grid.Placement, BeforePresent: boolean, AfterPresent: boolean }
-type FloorChange = { X: number, Z: number, Floor: number, BeforeMaterial: number, AfterMaterial: number }
-type CeilingState = { TopOffset: number, Material: number }
+type ColorChange = { Id: number, BeforeColors: SharedColorService.SlotMap?, AfterColors: SharedColorService.SlotMap? }
+-- Floor state is the (material, tint) pair; material 0 means "no explicit tile".
+type FloorState = { Material: number, Color: number? }
+type FloorChange = { X: number, Z: number, Floor: number, Before: FloorState, After: FloorState }
+type CeilingState = { TopOffset: number, Material: number, Color: number? }
 type CeilingChange = {
 	X: number,
 	Z: number,
 	Floor: number,
 	BeforeCeiling: CeilingState?,
 	AfterCeiling: CeilingState?,
-	BeforeFloorMaterial: number,
-	AfterFloorMaterial: number,
+	BeforeFloor: FloorState,
+	AfterFloor: FloorState,
 }
 type HistoryEntry =
 	{ Kind: "Placement", Changes: { PlacementChange } }
 	| { Kind: "Floor", Changes: { FloorChange } }
 	| { Kind: "Ceiling", Changes: { CeilingChange } }
+	| { Kind: "Color", Changes: { ColorChange } }
 type HistoryState = { Undo: { HistoryEntry }, Redo: { HistoryEntry } }
 
 local Histories: { [Player]: HistoryState } = {}
@@ -88,6 +93,7 @@ local paintRemote = BuildingRemotes:WaitForChild("Paint") :: RemoteFunction
 local ceilingRemote = BuildingRemotes:WaitForChild("Ceiling") :: RemoteFunction
 local historyRemote = BuildingRemotes:WaitForChild("History") :: RemoteFunction
 local resetRemote = BuildingRemotes:WaitForChild("Reset") :: RemoteFunction
+local recolorRemote = BuildingRemotes:WaitForChild("Recolor") :: RemoteFunction
 
 local function pushHistory(player: Player, entry: HistoryEntry)
 	local history = Histories[player]
@@ -160,15 +166,34 @@ local function render(plot, placement)
 		)
 	end
 
+	SharedColorService:ApplyColors(clone, placement.Name, placement.Colors)
 	clone.Parent = getBuildContainer(plot)
+end
+
+--[[Returns the rendered instance for a placement id, or nil.]]
+local function findRendered(plot, placementId): Model?
+	for _, child in getBuildContainer(plot):GetChildren() do
+		if child:GetAttribute("PlacementId") == placementId then
+			return child :: Model
+		end
+	end
+	return nil
+end
+
+--[[Repaints an already-rendered placement in place. Colour is presentation only, so
+there's no need to rebuild the clone or touch the grid's occupancy.]]
+local function rerender(plot, placement: Grid.Placement)
+	local rendered = findRendered(plot, placement.Id)
+	if rendered then
+		SharedColorService:ApplyColors(rendered, placement.Name, placement.Colors)
+	end
 end
 
 --[[Removes the rendered instance for a placement id.]]
 local function derender(plot, placementId)
-	for _, child in getBuildContainer(plot):GetChildren() do
-		if child:GetAttribute("PlacementId") == placementId then
-			child:Destroy()
-		end
+	local rendered = findRendered(plot, placementId)
+	if rendered then
+		rendered:Destroy()
 	end
 end
 
@@ -188,25 +213,34 @@ Returns a painted floor cell's tile descriptor for meshing - its material index 
 world Y of its supporting surface - or nil if the cell has no explicit tile. Elevated
 grass is an explicit tile; base-floor grass remains the plot's implicit default.
 ]]
-local function floorTileAt(grid, x: number, z: number, floor: number): ({ Material: number, SurfaceY: number }?)
+local function floorTileAt(
+	grid,
+	x: number,
+	z: number,
+	floor: number
+): ({ Material: number, Color: number?, SurfaceY: number }?)
 	local entry = grid:GetFloorEntry(x, z, floor)
 	if not entry then
 		return nil
 	end
 	if floor == 1 then
-		return { Material = entry.Material, SurfaceY = grid.Origin.Y }
+		return { Material = entry.Material, Color = entry.Color, SurfaceY = grid.Origin.Y }
 	end
 	local ceiling = grid:GetCeiling(x, z, floor - 1)
 	if not ceiling then
 		return nil
 	end
-	return { Material = entry.Material, SurfaceY = grid.Origin.Y + SharedBuildingService:GetLevelBaseOffset(floor) }
+	return {
+		Material = entry.Material,
+		Color = entry.Color,
+		SurfaceY = grid.Origin.Y + SharedBuildingService:GetLevelBaseOffset(floor),
+	}
 end
 
 --[[
 Re-meshes an entire floor: destroys its existing tiles and rebuilds them as merged
 rectangles via greedy meshing, so a run of same-material cells becomes one part instead
-of many. Cells only merge if they share both material and top-Y. (TODO(perf): re-mesh
+of many. Cells only merge if they share material, tint, and top-Y. (TODO(perf): re-mesh
 only the dirty region rather than the whole floor.)
 ]]
 local function remeshFloor(plot, floor: number)
@@ -241,7 +275,10 @@ local function remeshFloor(plot, floor: number)
 					return false
 				end
 				local other = floorTileAt(grid, cx, cz, floor)
-				return other ~= nil and other.Material == tile.Material and other.SurfaceY == tile.SurfaceY
+				return other ~= nil
+					and other.Material == tile.Material
+					and other.Color == tile.Color
+					and other.SurfaceY == tile.SurfaceY
 			end
 
 			local w = 1
@@ -272,7 +309,8 @@ local function remeshFloor(plot, floor: number)
 			part.Anchored = true
 			part.CanCollide = false
 			part.Size = Vector3.new(w * cell, Building.FLOOR_THICKNESS, h * cell)
-			part.Material = (Enum.Material :: any)[Materials.Floor[tile.Material]]
+			part.Material = (Enum.Material :: any)[Materials.Floor[tile.Material].Material]
+			part.Color = SharedColorService:MaterialColor("Floor", tile.Material, tile.Color)
 			-- The overlay's bottom rests directly on its supporting surface.
 			part.CFrame = CFrame.new(
 				grid.Origin.X + (x + w / 2) * cell,
@@ -281,6 +319,8 @@ local function remeshFloor(plot, floor: number)
 			)
 			part:SetAttribute("FloorLevel", floor)
 			part:SetAttribute("MaterialIndex", tile.Material)
+			-- Stamped so the client's recolour tool can read a tile's current tint.
+			part:SetAttribute("TintColor", tile.Color)
 			part.Parent = container
 		end
 	end
@@ -299,7 +339,15 @@ end
 
 --[[Renders a cell-sized ceiling slab from its stored top-surface offset. Its top is flush
 with the selected level top (the next floor surface) and its thickness hangs below it.]]
-local function renderCeiling(plot, x: number, z: number, floor: number, topOffset: number, materialIndex: number)
+local function renderCeiling(
+	plot,
+	x: number,
+	z: number,
+	floor: number,
+	topOffset: number,
+	materialIndex: number,
+	color: number?
+)
 	local container = getCeilingContainer(plot)
 	local key = Grid.ceilingKey(x, z, floor)
 	local slab = container:FindFirstChild(key)
@@ -319,7 +367,9 @@ local function renderCeiling(plot, x: number, z: number, floor: number, topOffse
 	slab:SetAttribute("Floor", floor)
 	slab:SetAttribute("TopOffset", topOffset)
 	slab:SetAttribute("MaterialIndex", materialIndex)
-	slab.Material = (Enum.Material :: any)[Materials.Ceiling[materialIndex]]
+	slab:SetAttribute("TintColor", color)
+	slab.Material = (Enum.Material :: any)[Materials.Ceiling[materialIndex].Material]
+	slab.Color = SharedColorService:MaterialColor("Ceiling", materialIndex, color)
 	slab.CFrame = CFrame.new(centre.X, topY - Building.CEILING_THICKNESS / 2, centre.Z)
 	slab.Parent = container
 end
@@ -353,7 +403,7 @@ local function renderGrid(plot)
 		render(plot, placement)
 	end
 	for _, ceiling in grid:GetCeilings() do
-		renderCeiling(plot, ceiling.X, ceiling.Z, ceiling.Floor, ceiling.TopOffset, ceiling.Material)
+		renderCeiling(plot, ceiling.X, ceiling.Z, ceiling.Floor, ceiling.TopOffset, ceiling.Material, ceiling.Color)
 	end
 	local floors = {}
 	for _, floorEntry in grid:GetFloorEntries() do
@@ -384,13 +434,16 @@ local function loadPlot(player: Player, plot)
 	end)
 end
 
-local function explicitFloorMaterial(grid: Grid.Grid, x: number, z: number, floor: number): number
+--[[Snapshots a cell's explicit floor tile. Material 0 means "no tile here".]]
+local function copyFloor(grid: Grid.Grid, x: number, z: number, floor: number): FloorState
 	local entry = grid:GetFloorEntry(x, z, floor)
-	return if entry then entry.Material else 0
+	return if entry then { Material = entry.Material, Color = entry.Color } else { Material = 0 }
 end
 
 local function copyCeiling(entry: Grid.CeilingEntry?): CeilingState?
-	return if entry then { TopOffset = entry.TopOffset, Material = entry.Material } else nil
+	return if entry
+		then { TopOffset = entry.TopOffset, Material = entry.Material, Color = entry.Color }
+		else nil
 end
 
 -- Applies one compact transaction side directly to the authoritative grid. History is
@@ -408,15 +461,18 @@ local function applyHistory(plot, entry: HistoryEntry, after: boolean)
 				derender(plot, id)
 			end
 		end
+	elseif entry.Kind == "Color" then
+		for _, change in entry.Changes do
+			local colors = if after then change.AfterColors else change.BeforeColors
+			if grid:SetPlacementColors(change.Id, colors) then
+				rerender(plot, grid:GetPlacement(change.Id))
+			end
+		end
 	elseif entry.Kind == "Floor" then
 		local dirtyFloors = {}
 		for _, change in entry.Changes do
-			grid:SetFloorMaterial(
-				change.X,
-				change.Z,
-				change.Floor,
-				if after then change.AfterMaterial else change.BeforeMaterial
-			)
+			local state = if after then change.After else change.Before
+			grid:SetFloorMaterial(change.X, change.Z, change.Floor, state.Material, state.Color)
 			dirtyFloors[change.Floor] = true
 		end
 		for floor in dirtyFloors do
@@ -427,18 +483,22 @@ local function applyHistory(plot, entry: HistoryEntry, after: boolean)
 		for _, change in entry.Changes do
 			local ceiling = if after then change.AfterCeiling else change.BeforeCeiling
 			if ceiling then
-				grid:SetCeiling(change.X, change.Z, change.Floor, ceiling.TopOffset, ceiling.Material)
-				renderCeiling(plot, change.X, change.Z, change.Floor, ceiling.TopOffset, ceiling.Material)
+				grid:SetCeiling(change.X, change.Z, change.Floor, ceiling.TopOffset, ceiling.Material, ceiling.Color)
+				renderCeiling(
+					plot,
+					change.X,
+					change.Z,
+					change.Floor,
+					ceiling.TopOffset,
+					ceiling.Material,
+					ceiling.Color
+				)
 			else
 				grid:RemoveCeiling(change.X, change.Z, change.Floor)
 				derenderCeiling(plot, change.X, change.Z, change.Floor)
 			end
-			grid:SetFloorMaterial(
-				change.X,
-				change.Z,
-				change.Floor + 1,
-				if after then change.AfterFloorMaterial else change.BeforeFloorMaterial
-			)
+			local floorState = if after then change.AfterFloor else change.BeforeFloor
+			grid:SetFloorMaterial(change.X, change.Z, change.Floor + 1, floorState.Material, floorState.Color)
 			dirtyFloors[change.Floor + 1] = true
 		end
 		for floor in dirtyFloors do
@@ -478,7 +538,15 @@ end
 
 -- Validates and commits one placement without persisting, so clicks and drags share
 -- exactly one authoritative path.
-local function placeOne(plot, name: string, x: number, z: number, floor: number, rotation: number): (number?, string?)
+local function placeOne(
+	plot,
+	name: string,
+	x: number,
+	z: number,
+	floor: number,
+	rotation: number,
+	colors: SharedColorService.SlotMap?
+): (number?, string?)
 	local grid = plot:GetGrid()
 	local ok, reason = SharedBuildingService:CanPlace(grid, name, x, z, floor, rotation)
 	if not ok then
@@ -494,13 +562,20 @@ local function placeOne(plot, name: string, x: number, z: number, floor: number,
 		Rotation = rotation,
 		Cells = cells,
 		Edges = edges,
+		Colors = colors,
 	})
 	render(plot, grid:GetPlacement(id))
 	return id
 end
 
---[[Places every valid request. An ordinary click is simply a one-entry request list.]]
-function ServerBuildingService:Place(player: Player, name: string, requests: { PlacementRequest }): (number, string?)
+--[[Places every valid request. An ordinary click is simply a one-entry request list.
+One colour map applies to the whole batch - a drag paints every copy the same.]]
+function ServerBuildingService:Place(
+	player: Player,
+	name: string,
+	requests: { PlacementRequest },
+	colors: any
+): (number, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
 		return 0, "no plot"
@@ -514,11 +589,16 @@ function ServerBuildingService:Place(player: Player, name: string, requests: { P
 		return 0, "invalid drag"
 	end
 
+	-- Client-supplied colours are never trusted: unknown slots and out-of-range values
+	-- are dropped, and anything matching the authored default is stripped so it costs
+	-- nothing to save.
+	local cleanColors = SharedColorService:Sanitize(name, colors)
+
 	local placed = 0
 	local firstReason: string? = nil
 	local changes: { PlacementChange } = {}
 	for _, request in requests do
-		local id, reason = placeOne(plot, name, request.X, request.Z, request.Floor, request.Rotation)
+		local id, reason = placeOne(plot, name, request.X, request.Z, request.Floor, request.Rotation, cleanColors)
 		if not id then
 			firstReason = firstReason or reason
 			continue
@@ -572,12 +652,62 @@ function ServerBuildingService:Remove(player: Player, placementIds: { number }):
 	return removed
 end
 
---[[Paints every changed, valid request and remeshes once. A click sends one request.]]
+--[[
+Recolours existing placements by id, the same id source as :Remove (so a client can only
+recolour builds in its own plot grid). Colours are sanitised per placement, since each id
+may be a different asset with different slots. Placements already showing the requested
+colours are skipped so a no-op click doesn't push a dead undo entry. Returns the count.
+]]
+function ServerBuildingService:Recolor(player: Player, placementIds: { number }, colors: any): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
+	local grid = plot:GetGrid()
+	if #placementIds < 1 or #placementIds > grid.Width * grid.Depth then
+		return 0, "invalid request"
+	end
+
+	local recolored, seen = 0, {}
+	local changes: { ColorChange } = {}
+	for _, placementId in placementIds do
+		if seen[placementId] then
+			continue
+		end
+		seen[placementId] = true
+
+		local placement = grid:GetPlacement(placementId)
+		if not placement then
+			continue
+		end
+		local before = placement.Colors
+		local after = SharedColorService:Sanitize(placement.Name, colors)
+		if SharedColorService:Equal(before, after) then
+			continue
+		end
+
+		grid:SetPlacementColors(placementId, after)
+		rerender(plot, placement)
+		table.insert(changes, { Id = placementId, BeforeColors = before, AfterColors = after })
+		recolored += 1
+	end
+
+	if recolored > 0 then
+		pushHistory(player, { Kind = "Color", Changes = changes })
+		persist(plot)
+	end
+	return recolored, if recolored > 0 then nil else "nothing to recolour"
+end
+
+--[[Paints every changed, valid request and remeshes once. A click sends one request.
+Recolouring a floor is just repainting it with the same material and a different tint,
+so it shares this path (and its undo entry) rather than needing one of its own.]]
 function ServerBuildingService:PaintFloor(
 	player: Player,
 	requests: { CellRequest },
 	floor: number,
-	materialIndex: number
+	materialIndex: number,
+	color: any
 ): (number, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
@@ -594,27 +724,33 @@ function ServerBuildingService:PaintFloor(
 		return 0, "invalid drag"
 	end
 
+	local cleanColor = SharedColorService:SanitizeMaterialColor("Floor", materialIndex, color)
+
 	local painted = 0
 	local seen = {}
 	local changes: { FloorChange } = {}
 	for _, request in requests do
 		local key = `{request.X},{request.Z}`
 		local entry = grid:GetFloorEntry(request.X, request.Z, floor)
-		local unchanged = if entry then entry.Material == materialIndex else floor == 1 and materialIndex == 1
+		-- A tint-only change still counts as a change, so recolouring an already-correct
+		-- material isn't rejected as a no-op.
+		local unchanged = if entry
+			then entry.Material == materialIndex and entry.Color == cleanColor
+			else floor == 1 and materialIndex == 1 and cleanColor == nil
 		local valid = not seen[key] and grid:IsInBounds(request.X, request.Z)
 			and (if materialIndex == 0
 				then entry ~= nil
 				else not unchanged and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor))
 		seen[key] = true
 		if valid then
-			local beforeMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor)
-			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex)
+			local before = copyFloor(grid, request.X, request.Z, floor)
+			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex, cleanColor)
 			table.insert(changes, {
 				X = request.X,
 				Z = request.Z,
 				Floor = floor,
-				BeforeMaterial = beforeMaterial,
-				AfterMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor),
+				Before = before,
+				After = copyFloor(grid, request.X, request.Z, floor),
 			})
 			painted += 1
 		end
@@ -632,7 +768,8 @@ function ServerBuildingService:PlaceCeiling(
 	player: Player,
 	requests: { CellRequest },
 	floor: number,
-	materialIndex: number
+	materialIndex: number,
+	color: any
 ): (number, string?)
 	local plot = ServerPlotService:GetPlayerPlot(player)
 	if not plot then
@@ -649,19 +786,20 @@ function ServerBuildingService:PlaceCeiling(
 		return 0, "invalid drag"
 	end
 
-	local placed = SharedBuildingService:FillCeilings(grid, requests, floor, materialIndex)
+	local cleanColor = SharedColorService:SanitizeMaterialColor("Ceiling", materialIndex, color)
+	local placed = SharedBuildingService:FillCeilings(grid, requests, floor, materialIndex, cleanColor)
 	local changes: { CeilingChange } = {}
 	for _, result in placed do
-		renderCeiling(plot, result.X, result.Z, floor, result.TopOffset, materialIndex)
-		local floorMaterial = explicitFloorMaterial(grid, result.X, result.Z, floor + 1)
+		renderCeiling(plot, result.X, result.Z, floor, result.TopOffset, materialIndex, cleanColor)
+		local floorState = copyFloor(grid, result.X, result.Z, floor + 1)
 		table.insert(changes, {
 			X = result.X,
 			Z = result.Z,
 			Floor = floor,
 			BeforeCeiling = nil,
 			AfterCeiling = copyCeiling(grid:GetCeiling(result.X, result.Z, floor)),
-			BeforeFloorMaterial = floorMaterial,
-			AfterFloorMaterial = floorMaterial,
+			BeforeFloor = floorState,
+			AfterFloor = floorState,
 		})
 	end
 	if #placed > 0 then
@@ -669,6 +807,66 @@ function ServerBuildingService:PlaceCeiling(
 		persist(plot)
 	end
 	return #placed, if #placed > 0 then nil else "no available floor cells"
+end
+
+--[[
+Retints existing ceiling slabs, keeping their material. Placing can't do this job the way
+repainting a floor can, because FillCeilings deliberately skips cells that already have a
+slab. Reuses the Ceiling history kind, with the before/after states differing only in tint.
+]]
+function ServerBuildingService:RecolorCeiling(
+	player: Player,
+	requests: { CellRequest },
+	floor: number,
+	color: any
+): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
+	local grid = plot:GetGrid()
+	if floor < 1 or floor % 1 ~= 0 or #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0, "invalid request"
+	end
+
+	local recolored, seen = 0, {}
+	local changes: { CeilingChange } = {}
+	for _, request in requests do
+		local key = `{request.X},{request.Z}`
+		if seen[key] then
+			continue
+		end
+		seen[key] = true
+
+		local before = copyCeiling(grid:GetCeiling(request.X, request.Z, floor))
+		if not before then
+			continue
+		end
+		local cleanColor = SharedColorService:SanitizeMaterialColor("Ceiling", before.Material, color)
+		if cleanColor == before.Color then
+			continue
+		end
+
+		grid:SetCeiling(request.X, request.Z, floor, before.TopOffset, before.Material, cleanColor)
+		renderCeiling(plot, request.X, request.Z, floor, before.TopOffset, before.Material, cleanColor)
+		local floorState = copyFloor(grid, request.X, request.Z, floor + 1)
+		table.insert(changes, {
+			X = request.X,
+			Z = request.Z,
+			Floor = floor,
+			BeforeCeiling = before,
+			AfterCeiling = copyCeiling(grid:GetCeiling(request.X, request.Z, floor)),
+			BeforeFloor = floorState,
+			AfterFloor = floorState,
+		})
+		recolored += 1
+	end
+
+	if recolored > 0 then
+		pushHistory(player, { Kind = "Ceiling", Changes = changes })
+		persist(plot)
+	end
+	return recolored, if recolored > 0 then nil else "nothing to recolour"
 end
 
 --[[
@@ -694,7 +892,7 @@ function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellReq
 		local occupantEntry = occupant and SharedBuildingService:GetEntry(occupant.Name)
 		local supportsHanger = occupantEntry and occupantEntry.Type == "Hanger"
 		if ceiling and not supportsHanger and grid:RemoveCeiling(request.X, request.Z, floor) then
-			local floorMaterial = explicitFloorMaterial(grid, request.X, request.Z, floor + 1)
+			local beforeFloor = copyFloor(grid, request.X, request.Z, floor + 1)
 			grid:SetFloorMaterial(request.X, request.Z, floor + 1, 0)
 			derenderCeiling(plot, request.X, request.Z, floor)
 			table.insert(changes, {
@@ -703,8 +901,8 @@ function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellReq
 				Floor = floor,
 				BeforeCeiling = ceiling,
 				AfterCeiling = nil,
-				BeforeFloorMaterial = floorMaterial,
-				AfterFloorMaterial = 0,
+				BeforeFloor = beforeFloor,
+				AfterFloor = { Material = 0 },
 			})
 			removed += 1
 		end
@@ -721,11 +919,20 @@ end
 -- Client entry points (RemoteFunctions so the client gets accept/reject feedback for
 -- its preview). Basic numeric guards keep malformed requests from erroring the grid;
 -- full validation lives in :Place / :Remove. TODO: per-player rate limiting.
-placeRemote.OnServerInvoke = function(player, name, requests)
+placeRemote.OnServerInvoke = function(player, name, requests, colors)
 	if type(name) ~= "string" or not isRequestList(requests, isPlacementRequest) then
 		return 0, "bad request"
 	end
-	return ServerBuildingService:Place(player, name, requests)
+	-- `colors` needs no shape guard here; SharedColorService:Sanitize rejects anything
+	-- that isn't a table of valid slot -> packed-colour pairs.
+	return ServerBuildingService:Place(player, name, requests, colors)
+end
+
+recolorRemote.OnServerInvoke = function(player, placementIds, colors)
+	if not isRequestList(placementIds, isGridInteger) then
+		return 0, "bad request"
+	end
+	return ServerBuildingService:Recolor(player, placementIds, colors)
 end
 
 removeRemote.OnServerInvoke = function(player, placementIds)
@@ -735,19 +942,26 @@ removeRemote.OnServerInvoke = function(player, placementIds)
 	return ServerBuildingService:Remove(player, placementIds)
 end
 
-paintRemote.OnServerInvoke = function(player, requests, floor, materialIndex)
+-- `color` needs no shape guard on these; SharedColorService:SanitizeMaterialColor
+-- rejects anything that isn't an in-range packed integer.
+paintRemote.OnServerInvoke = function(player, requests, floor, materialIndex, color)
 	if not isRequestList(requests, isCellRequest) or not (isGridInteger(floor) and isGridInteger(materialIndex)) then
 		return 0, "bad request"
 	end
-	return ServerBuildingService:PaintFloor(player, requests, floor, materialIndex)
+	return ServerBuildingService:PaintFloor(player, requests, floor, materialIndex, color)
 end
 
-ceilingRemote.OnServerInvoke = function(player, action, target, second, third)
+ceilingRemote.OnServerInvoke = function(player, action, target, second, third, fourth)
 	if action == "place" then
 		if not isRequestList(target, isCellRequest) or not (isGridInteger(second) and isGridInteger(third)) then
 			return 0, "bad request"
 		end
-		return ServerBuildingService:PlaceCeiling(player, target, second, third)
+		return ServerBuildingService:PlaceCeiling(player, target, second, third, fourth)
+	elseif action == "recolor" then
+		if not isRequestList(target, isCellRequest) or not isGridInteger(second) then
+			return 0, "bad request"
+		end
+		return ServerBuildingService:RecolorCeiling(player, target, second, third)
 	elseif action == "remove" then
 		if isRequestList(target, isCellRequest) and isGridInteger(second) then
 			return ServerBuildingService:RemoveCeiling(player, target, second)

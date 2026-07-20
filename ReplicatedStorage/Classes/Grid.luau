@@ -32,22 +32,37 @@ export type Placement = {
 	Rotation: number, -- 0..3
 	Cells: { string }, -- occupied cell keys (empty for pure-wall placements)
 	Edges: { string }, -- occupied edge keys (empty for non-wall placements)
+	-- Customised colours, slot -> packed 24-bit colour. Absent slots (and a nil map)
+	-- mean the asset's authored default. See SharedColorService.
+	Colors: { [number]: number }?,
 }
 
--- The compact per-placement tuple actually written to the save (see Compress).
-export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot}
+-- The compact per-placement tuple actually written to the save (see Compress). The
+-- trailing colour-set index is omitted entirely when the placement is all-default.
+export type SavedPlacement = { number } -- {paletteIndex, x, z, floor, rot, colorSetIndex?}
 -- Painted floor material (index into Config.Materials.Floor), per floor + cell. Grass
 -- is implicit on the plot base but stored when explicitly painted on an upper floor.
-export type FloorEntry = { Floor: number, X: number, Z: number, Material: number }
+-- Color is a packed 24-bit tint, or nil for the material's default (see Config/Materials).
+export type FloorEntry = { Floor: number, X: number, Z: number, Material: number, Color: number? }
 -- A ceiling capping one build floor at a cell. TopOffset is its top surface's height
 -- above Origin.Y; each ceiling can become the surface for the next build level.
-export type CeilingEntry = { Floor: number, X: number, Z: number, TopOffset: number, Material: number }
+export type CeilingEntry = {
+	Floor: number,
+	X: number,
+	Z: number,
+	TopOffset: number,
+	Material: number,
+	Color: number?,
+}
 
 export type SaveBlob = {
 	Palette: { string },
+	-- Deduped colour sets, each a flat {slot, packedColor, slot, packedColor, ...}.
+	-- Placements index into this rather than repeating their own colour map.
+	ColorSets: { { number } },
 	Placements: { SavedPlacement },
-	Floors: { { number } }, -- {floor, x, z, materialIndex}
-	Ceilings: { { number } }, -- {floor, x, z, topOffsetStuds, materialIndex}
+	Floors: { { number } }, -- {floor, x, z, materialIndex, packedColor?}
+	Ceilings: { { number } }, -- {floor, x, z, topOffsetStuds, materialIndex, packedColor?}
 }
 
 export type Grid = typeof(setmetatable(
@@ -179,12 +194,14 @@ end
 
 --[[Sets a cell's painted floor material. Material 0 removes the overlay; base-floor
 grass remains implicit, while upper-floor grass must be stored so it can render.]]
-function Grid:SetFloorMaterial(x: number, z: number, floor: number, material: number)
+function Grid:SetFloorMaterial(x: number, z: number, floor: number, material: number, color: number?)
 	local key = Grid.cellKey(x, z, floor)
-	if material < 1 or (floor == 1 and material == 1) then
+	-- A tinted base-floor grass cell still has to be stored, since it no longer matches
+	-- the implicit default the plot renders for free.
+	if material < 1 or (floor == 1 and material == 1 and color == nil) then
 		self._floors[key] = nil
 	else
-		self._floors[key] = { Floor = floor, X = x, Z = z, Material = material }
+		self._floors[key] = { Floor = floor, X = x, Z = z, Material = material, Color = color }
 	end
 end
 
@@ -206,13 +223,21 @@ function Grid.ceilingKey(x: number, z: number, floor: number): string
 end
 
 --[[Adds/updates the ceiling capping a cell.]]
-function Grid:SetCeiling(x: number, z: number, floor: number, topOffset: number, material: number)
+function Grid:SetCeiling(
+	x: number,
+	z: number,
+	floor: number,
+	topOffset: number,
+	material: number,
+	color: number?
+)
 	self._ceilings[Grid.ceilingKey(x, z, floor)] = {
 		Floor = floor,
 		X = x,
 		Z = z,
 		TopOffset = topOffset,
 		Material = material,
+		Color = color,
 	}
 end
 
@@ -252,6 +277,7 @@ function Grid:AddPlacement(data: {
 	Rotation: number,
 	Cells: { string },
 	Edges: { string },
+	Colors: { [number]: number }?,
 }): number
 	local id = data.Id or self._nextId
 	self._nextId = math.max(self._nextId, id + 1)
@@ -265,6 +291,7 @@ function Grid:AddPlacement(data: {
 		Rotation = data.Rotation,
 		Cells = data.Cells,
 		Edges = data.Edges,
+		Colors = data.Colors,
 	}
 	self._placements[id] = placement
 
@@ -300,6 +327,17 @@ function Grid:RemovePlacement(id: number): Placement?
 	return placement
 end
 
+--[[Sets a placement's custom colours (nil restores the asset's authored defaults).
+Occupancy is unaffected - colour is presentation only. Returns whether it existed.]]
+function Grid:SetPlacementColors(id: number, colors: { [number]: number }?): boolean
+	local placement = self._placements[id]
+	if not placement then
+		return false
+	end
+	placement.Colors = colors
+	return true
+end
+
 --[[Iterates all placements. (Order is not guaranteed.)]]
 function Grid:GetPlacements(): { [number]: Placement }
 	return self._placements
@@ -311,14 +349,51 @@ end
 Compresses the grid to the save blob. Strategy:
   * A per-plot Palette dedupes the catalog names actually used, so each placement
     references a small integer instead of repeating a string.
-  * Each placement becomes a flat integer tuple {paletteIndex, x, z, floor, rot}.
+  * ColorSets does the same for custom colours - players tend to recolour many objects
+    identically, so whole colour maps dedupe well.
+  * Each placement becomes a flat integer tuple {paletteIndex, x, z, floor, rot} with
+    a sixth colour-set index appended only when the placement isn't all-default.
   * Derived occupancy (Cells/Edges) is NOT saved - Decompress rebuilds it.
-Anything left at defaults (empty cells and base-floor grass) is simply absent.
+Anything left at defaults (empty cells, base-floor grass, authored colours) is absent.
 ]]
 function Grid:Compress(): SaveBlob
 	local palette: { string } = {}
 	local paletteIndex: { [string]: number } = {}
 	local placements: { SavedPlacement } = {}
+
+	-- Colour maps are flattened to sorted {slot, colour, ...} pairs so they stay dense
+	-- arrays (a sparse map would not survive datastore serialisation intact) and so
+	-- identical maps produce an identical dedupe key.
+	local colorSets: { { number } } = {}
+	local colorSetIndex: { [string]: number } = {}
+
+	local function colorSetFor(colors: { [number]: number }?): number
+		if not colors then
+			return 0
+		end
+		local slots = {}
+		for slot in colors do
+			table.insert(slots, slot)
+		end
+		if #slots == 0 then
+			return 0
+		end
+		table.sort(slots)
+
+		local flat = {}
+		for _, slot in slots do
+			table.insert(flat, slot)
+			table.insert(flat, colors[slot])
+		end
+		local key = table.concat(flat, ",")
+		local index = colorSetIndex[key]
+		if not index then
+			table.insert(colorSets, flat)
+			index = #colorSets
+			colorSetIndex[key] = index
+		end
+		return index
+	end
 
 	for _, placement in self._placements do
 		local index = paletteIndex[placement.Name]
@@ -329,20 +404,40 @@ function Grid:Compress(): SaveBlob
 		end
 
 		local tuple: SavedPlacement = { index, placement.X, placement.Z, placement.Floor, placement.Rotation }
+		local colorSet = colorSetFor(placement.Colors)
+		if colorSet > 0 then
+			tuple[6] = colorSet
+		end
 		table.insert(placements, tuple)
 	end
 
+	-- The trailing colour is appended only when tinted, so untinted plots serialise
+	-- byte-for-byte as they did before colours existed.
 	local floors: { { number } } = {}
 	for _, entry in self._floors do
-		table.insert(floors, { entry.Floor, entry.X, entry.Z, entry.Material })
+		local tuple = { entry.Floor, entry.X, entry.Z, entry.Material }
+		if entry.Color then
+			tuple[5] = entry.Color
+		end
+		table.insert(floors, tuple)
 	end
 
 	local ceilings: { { number } } = {}
 	for _, entry in self._ceilings do
-		table.insert(ceilings, { entry.Floor, entry.X, entry.Z, entry.TopOffset, entry.Material })
+		local tuple = { entry.Floor, entry.X, entry.Z, entry.TopOffset, entry.Material }
+		if entry.Color then
+			tuple[6] = entry.Color
+		end
+		table.insert(ceilings, tuple)
 	end
 
-	return { Palette = palette, Placements = placements, Floors = floors, Ceilings = ceilings }
+	return {
+		Palette = palette,
+		ColorSets = colorSets,
+		Placements = placements,
+		Floors = floors,
+		Ceilings = ceilings,
+	}
 end
 
 --[[
@@ -362,6 +457,16 @@ function Grid.Decompress(
 		return self
 	end
 
+	-- Colour sets are shared between placements, so unflatten each one once.
+	local colorSets: { { [number]: number } } = {}
+	for index, flat in blob.ColorSets or {} do
+		local colors = {}
+		for i = 1, #flat - 1, 2 do
+			colors[flat[i]] = flat[i + 1]
+		end
+		colorSets[index] = colors
+	end
+
 	for _, tuple in blob.Placements do
 		local name = blob.Palette[tuple[1]]
 		if not name then
@@ -370,6 +475,7 @@ function Grid.Decompress(
 		end
 		local x, z, floor, rotation = tuple[2], tuple[3], tuple[4], tuple[5]
 		local cells, edges = resolveFootprint(name, x, z, floor, rotation)
+		-- Saves written before colour customisation simply have no sixth element.
 		self:AddPlacement({
 			Name = name,
 			X = x,
@@ -378,16 +484,17 @@ function Grid.Decompress(
 			Rotation = rotation,
 			Cells = cells,
 			Edges = edges,
+			Colors = if tuple[6] then colorSets[tuple[6]] else nil,
 		})
 	end
 
 	for _, tuple in blob.Floors or {} do
-		self:SetFloorMaterial(tuple[2], tuple[3], tuple[1], tuple[4])
+		self:SetFloorMaterial(tuple[2], tuple[3], tuple[1], tuple[4], tuple[5])
 	end
 
 	for _, tuple in blob.Ceilings or {} do
 		if #tuple >= 5 then
-			self:SetCeiling(tuple[2], tuple[3], tuple[1], tuple[1] * Building.WALL_HEIGHT, tuple[5])
+			self:SetCeiling(tuple[2], tuple[3], tuple[1], tuple[1] * Building.WALL_HEIGHT, tuple[5], tuple[6])
 		else
 			-- Legacy ceiling tuple: {x, z, heightLevel, materialIndex}.
 			self:SetCeiling(tuple[1], tuple[2], 1, Building.WALL_HEIGHT, tuple[4])

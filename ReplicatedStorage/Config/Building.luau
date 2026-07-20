@@ -52,6 +52,15 @@ Building.Camera = {
 -- Rotation is in 90-degree increments, stored as 0..3.
 Building.ROTATION_STEPS = 4
 
+-- Colour customisation. A placeable declares its recolourable groups by tagging parts
+-- `Color1` .. `Color{COLOR_SLOTS}`; the authored colour of those parts is that slot's
+-- default. What each slot MEANS is per-object (on a plant Color1 is the pot, on a light
+-- it's the bulb), so preset palettes live in each item's Config/Items entry rather than
+-- in a global list. See SharedColorService.
+-- Raising COLOR_SLOTS is safe; lowering it orphans colours already saved on dropped slots.
+Building.COLOR_SLOTS = 5
+Building.COLOR_TAG_PREFIX = "Color"
+
 -- The base grid defaults to grass; cells are only stored in the save when they
 -- differ from this, keeping empty plots nearly free to serialize.
 Building.DEFAULT_FLOOR_MATERIAL = "Grass"
