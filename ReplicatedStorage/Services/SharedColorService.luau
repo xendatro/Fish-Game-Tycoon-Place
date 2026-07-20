@@ -150,11 +150,6 @@ end
 
 -- ===== Queries ==============================================================
 
---[[Returns an asset's authored slot->colour defaults (nil if it has no colour slots).]]
-function SharedColorService:GetDefaults(name: string): SlotMap?
-	return defaults[name]
-end
-
 --[[Returns an asset's defined slot numbers, ascending. Empty if it isn't colourable.]]
 function SharedColorService:GetSlots(name: string): { number }
 	local slots = {}
@@ -182,29 +177,22 @@ function SharedColorService:GetPalettes(name: string): { Palette }
 	return palettes[name] or {}
 end
 
---[[
-Resolves a player's colour choice into concrete colours for one asset. `paletteIndex`
-picks one of THAT asset's presets (nil = its authored default), and `overrides` maps the
-asset's own slots to exact player-picked colours, winning over the preset. Slots landing
-on the authored default are dropped, so an untouched item stores nothing.
-]]
-function SharedColorService:ResolveColors(name: string, paletteIndex: number?, overrides: SlotMap?): SlotMap?
-	local slots = defaults[name]
-	if not slots then
+--[[Parses "r,g,b" or "#rrggbb" into a packed colour, or nil if unparseable/empty.]]
+function SharedColorService.ParseColor(text: string): number?
+	local trimmed = text:gsub("%s", "")
+	local hex = trimmed:match("^#?(%x%x%x%x%x%x)$")
+	if hex then
+		return tonumber(hex, 16)
+	end
+	local red, green, blue = trimmed:match("^(%d+),(%d+),(%d+)$")
+	if not red then
 		return nil
 	end
-	local palette = paletteIndex and (palettes[name] or {})[paletteIndex]
-
-	local resolved: SlotMap = {}
-	local count = 0
-	for slot, default in slots do
-		local packed = (overrides and overrides[slot]) or (palette and palette.Colors[slot])
-		if packed and packed ~= default then
-			resolved[slot] = packed
-			count += 1
-		end
+	local r, g, b = tonumber(red), tonumber(green), tonumber(blue)
+	if r > 255 or g > 255 or b > 255 then
+		return nil
 	end
-	return if count > 0 then resolved else nil
+	return SharedColorService.Pack(Color3.fromRGB(r, g, b))
 end
 
 --[[
@@ -302,25 +290,10 @@ tile, defaulting to the material's `Color` in Config/Materials.
 
 export type MaterialKind = "Floor" | "Ceiling"
 
---[[Returns the config entry for a material index, or nil if out of range.]]
-function SharedColorService:GetMaterial(kind: MaterialKind, index: number)
-	return Materials[kind][index]
-end
-
 --[[Returns a material's authored default tint, packed.]]
 function SharedColorService:MaterialDefault(kind: MaterialKind, index: number): number?
 	local material = Materials[kind][index]
 	return if material then SharedColorService.Pack(material.Color) else nil
-end
-
---[[Returns a material's presets, each already packed.]]
-function SharedColorService:MaterialPalettes(kind: MaterialKind, index: number): { { Name: string, Color: number } }
-	local material = Materials[kind][index]
-	local packed = {}
-	for _, palette in (material and material.Palettes) or {} do
-		table.insert(packed, { Name = palette.Name, Color = SharedColorService.Pack(palette.Color) })
-	end
-	return packed
 end
 
 --[[

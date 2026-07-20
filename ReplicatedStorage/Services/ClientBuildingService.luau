@@ -926,7 +926,6 @@ local function floorCellsOfPart(grid: Grid.Grid, part: BasePart): { CellRequest 
 	return cells
 end
 
-
 local function createGhost(name: string): Model?
 	local model = SharedBuildingService:GetModel(name)
 	if not model then
@@ -1878,24 +1877,6 @@ local function buildDebugUI()
 		end)
 	end
 
-	--[[Parses "r,g,b" or "#rrggbb" into a packed colour, or nil if unparseable/empty.]]
-	local function parseColor(text: string): number?
-		local trimmed = text:gsub("%s", "")
-		local hex = trimmed:match("^#?(%x%x%x%x%x%x)$")
-		if hex then
-			return tonumber(hex, 16)
-		end
-		local red, green, blue = trimmed:match("^(%d+),(%d+),(%d+)$")
-		if not red then
-			return nil
-		end
-		local r, g, b = tonumber(red), tonumber(green), tonumber(blue)
-		if r > 255 or g > 255 or b > 255 then
-			return nil
-		end
-		return SharedColorService.Pack(Color3.fromRGB(r, g, b))
-	end
-
 	-- The Colors page edits the one global selection: always all five slots, unlabelled.
 	-- Per-object slot names ("Pot", "Trunk") belong to the item panel, where you can see
 	-- which object they apply to.
@@ -1972,7 +1953,7 @@ local function buildDebugUI()
 			slotBoxes[slot] = box
 
 			box.FocusLost:Connect(function()
-				local packed = parseColor(box.Text)
+				local packed = SharedColorService.ParseColor(box.Text)
 				ClientBuildingService:SetPlaceColor(slot, packed)
 				if not packed then
 					box.Text = ""

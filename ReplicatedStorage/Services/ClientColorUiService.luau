@@ -22,7 +22,6 @@ if not RunService:IsClient() then
 	return ClientColorUiService
 end
 
-local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
 local SharedColorService = require(ReplicatedStorage.Services.SharedColorService)
 local ClientBuildingService = require(ReplicatedStorage.Services.ClientBuildingService)
 local DataSaveService = require(ReplicatedStorage.Services.DataSaveService)
@@ -192,23 +191,6 @@ local function addSwatchStrip(parent: Instance, colors: SharedColorService.SlotM
 	return strip
 end
 
-local function parseColor(text: string): number?
-	local trimmed = text:gsub("%s", "")
-	local hex = trimmed:match("^#?(%x%x%x%x%x%x)$")
-	if hex then
-		return tonumber(hex, 16)
-	end
-	local red, green, blue = trimmed:match("^(%d+),(%d+),(%d+)$")
-	if not red then
-		return nil
-	end
-	local r, g, b = tonumber(red), tonumber(green), tonumber(blue)
-	if r > 255 or g > 255 or b > 255 then
-		return nil
-	end
-	return SharedColorService.Pack(Color3.fromRGB(r, g, b))
-end
-
 -- ===== Live preview =========================================================
 
 --[[Paints the selected object locally so the Custom panel updates as you type. The server
@@ -233,10 +215,10 @@ local showingPalettes = false
 
 --[[Applies colours to the selected object on the server. `linked` marks it as wearing the
 saved palette.]]
-local function commit(colors: SharedColorService.SlotMap?, linked: boolean): boolean
+local function commit(colors: SharedColorService.SlotMap?, linked: boolean)
 	local model = selectedModel
 	if not model then
-		return false
+		return
 	end
 	local ok, reason = ClientBuildingService:RecolorPlacement(
 		model:GetAttribute("PlacementId") :: number,
@@ -247,7 +229,6 @@ local function commit(colors: SharedColorService.SlotMap?, linked: boolean): boo
 		original, originalLinked = colors, linked
 	end
 	setStatus(if ok then "applied" else `rejected: {reason}`)
-	return ok
 end
 
 function showItem()
@@ -256,26 +237,19 @@ function showItem()
 	local name = selectedName :: string
 	title.Text = name
 
-	local entry = SharedBuildingService:GetEntry(name)
 	local info = Instance.new("TextLabel")
-	info.Size = UDim2.new(1, 0, 0, 34)
+	info.Size = UDim2.new(1, 0, 0, 28)
 	info.BackgroundTransparency = 1
 	info.TextColor3 = Color3.fromRGB(200, 200, 200)
-	info.TextWrapped = true
-	info.Text = `{if entry then entry.Type else "?"} | {if originalLinked then "using your palette" else "custom colours"}`
+	info.Text = if not SharedColorService:IsColorable(name)
+		then "No colour slots"
+		elseif originalLinked then "Using your palette"
+		else "Custom colours"
 	info.Parent = body
 
 	if SharedColorService:IsColorable(name) then
 		addButton(body, "Colors", showPalettes)
-	else
-		local notice = Instance.new("TextLabel")
-		notice.Size = UDim2.new(1, 0, 0, 28)
-		notice.BackgroundTransparency = 1
-		notice.TextColor3 = Color3.fromRGB(170, 210, 255)
-		notice.Text = "No colour slots"
-		notice.Parent = body
 	end
-
 	addButton(body, "Close", function()
 		ClientColorUiService:Close()
 	end)
@@ -459,7 +433,7 @@ function showCustom()
 		end
 
 		box.FocusLost:Connect(function()
-			local value = parseColor(box.Text)
+			local value = SharedColorService.ParseColor(box.Text)
 			draft[slot] = value
 			box.BackgroundColor3 = if value
 				then SharedColorService.Unpack(value)

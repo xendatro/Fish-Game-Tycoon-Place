@@ -808,19 +808,18 @@ silently invalidate. Rather than leave stale entries that could restore colours 
 objects that have since moved to a palette, a sweep clears the history.
 ]]
 
---[[Applies a colour map to every placement of one asset that passes `predicate`.]]
+--[[Links every placement of one asset that passes `predicate` to `colors`.]]
 local function sweepPalette(
 	plot,
 	name: string,
 	predicate: (Grid.Placement) -> boolean,
-	colors: SharedColorService.SlotMap?,
-	linked: boolean
+	colors: SharedColorService.SlotMap
 ): number
 	local changed = 0
 	for _, placement in plot:GetGrid():GetPlacements() do
 		if placement.Name == name and predicate(placement) then
 			placement.Colors = colors
-			placement.Linked = linked or nil
+			placement.Linked = true
 			rerender(plot, placement)
 			changed += 1
 		end
@@ -873,7 +872,7 @@ function ServerBuildingService:SavePalette(
 	local touched = 0
 	if existing and not SharedColorService:Equal(existing, clean) then
 		if propagate then
-			touched = sweepPalette(plot, name, isLinked, clean, true)
+			touched = sweepPalette(plot, name, isLinked, clean)
 		else
 			-- A linked object is already wearing the palette's previous colours, so
 			-- unlinking is just dropping the flag - nothing to repaint.
@@ -940,140 +939,13 @@ function ServerBuildingService:ApplyPalette(player: Player, name: string): (numb
 
 	local changed = sweepPalette(plot, name, function(placement)
 		return not placement.Linked or not SharedColorService:Equal(placement.Colors, palette)
-	end, palette, true)
+	end, palette)
 
 	if changed > 0 then
 		Histories[player] = nil
 		persist(plot)
 	end
 	return changed, if changed > 0 then nil else "everything already matches"
-end
-
---[[Forgets the saved palette. Linked objects keep their colours and simply unlink.]]
-function ServerBuildingService:ClearPalette(player: Player, name: string): (boolean, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot or not getPalette(player, name) then
-		return false, "no saved palette"
-	end
-	for _, placement in plot:GetGrid():GetPlacements() do
-		if placement.Name == name and placement.Linked then
-			placement.Linked = nil
-			rerender(plot, placement)
-		end
-	end
-	setPalette(player, name, nil)
-	persist(plot)
-	return true
-end
-
---[[Paints every changed, valid request and remeshes once. A click sends one request.
-Recolouring a floor is just repainting it with the same material and a different tint,
-so it shares this path (and its undo entry) rather than needing one of its own.]]
-function ServerBuildingService:PaintFloor(
-	player: Player,
-	requests: { CellRequest },
-	floor: number,
-	materialIndex: number,
-	color: any
-): (number, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot then
-		return 0, "no plot"
-	end
-	if floor < 1 or floor % 1 ~= 0 then
-		return 0, "invalid floor"
-	end
-	if materialIndex < 0 or materialIndex > #Materials.Floor then
-		return 0, "invalid material"
-	end
-	local grid = plot:GetGrid()
-	if #requests < 1 or #requests > grid.Width * grid.Depth then
-		return 0, "invalid drag"
-	end
-
-	local cleanColor = SharedColorService:SanitizeMaterialColor("Floor", materialIndex, color)
-
-	local painted = 0
-	local seen = {}
-	local changes: { FloorChange } = {}
-	for _, request in requests do
-		local key = `{request.X},{request.Z}`
-		local entry = grid:GetFloorEntry(request.X, request.Z, floor)
-		-- A tint-only change still counts as a change, so recolouring an already-correct
-		-- material isn't rejected as a no-op.
-		local unchanged = if entry
-			then entry.Material == materialIndex and entry.Color == cleanColor
-			else floor == 1 and materialIndex == 1 and cleanColor == nil
-		local valid = not seen[key] and grid:IsInBounds(request.X, request.Z)
-			and (if materialIndex == 0
-				then entry ~= nil
-				else not unchanged and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor))
-		seen[key] = true
-		if valid then
-			local before = copyFloor(grid, request.X, request.Z, floor)
-			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex, cleanColor)
-			table.insert(changes, {
-				X = request.X,
-				Z = request.Z,
-				Floor = floor,
-				Before = before,
-				After = copyFloor(grid, request.X, request.Z, floor),
-			})
-			painted += 1
-		end
-	end
-	if painted > 0 then
-		pushHistory(player, { Kind = "Floor", Changes = changes })
-		remeshFloor(plot, floor)
-		persist(plot)
-	end
-	return painted, if painted > 0 then nil else "no changed floor cells"
-end
-
---[[Places every available requested slab. The same path handles clicks and area drags.]]
-function ServerBuildingService:PlaceCeiling(
-	player: Player,
-	requests: { CellRequest },
-	floor: number,
-	materialIndex: number,
-	color: any
-): (number, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot then
-		return 0, "no plot"
-	end
-	if floor < 1 or floor % 1 ~= 0 then
-		return 0, "invalid floor"
-	end
-	if materialIndex < 1 or materialIndex > #Materials.Ceiling then
-		return 0, "invalid material"
-	end
-	local grid = plot:GetGrid()
-	if #requests < 1 or #requests > grid.Width * grid.Depth then
-		return 0, "invalid drag"
-	end
-
-	local cleanColor = SharedColorService:SanitizeMaterialColor("Ceiling", materialIndex, color)
-	local placed = SharedBuildingService:FillCeilings(grid, requests, floor, materialIndex, cleanColor)
-	local changes: { CeilingChange } = {}
-	for _, result in placed do
-		renderCeiling(plot, result.X, result.Z, floor, result.TopOffset, materialIndex, cleanColor)
-		local floorState = copyFloor(grid, result.X, result.Z, floor + 1)
-		table.insert(changes, {
-			X = result.X,
-			Z = result.Z,
-			Floor = floor,
-			BeforeCeiling = nil,
-			AfterCeiling = copyCeiling(grid:GetCeiling(result.X, result.Z, floor)),
-			BeforeFloor = floorState,
-			AfterFloor = floorState,
-		})
-	end
-	if #placed > 0 then
-		pushHistory(player, { Kind = "Ceiling", Changes = changes })
-		persist(plot)
-	end
-	return #placed, if #placed > 0 then nil else "no available floor cells"
 end
 
 --[[
@@ -1157,66 +1029,6 @@ function ServerBuildingService:PaintSurface(
 end
 
 --[[
-Retints existing ceiling slabs, keeping their material. Placing can't do this job the way
-repainting a floor can, because FillCeilings deliberately skips cells that already have a
-slab. Reuses the Ceiling history kind, with the before/after states differing only in tint.
-]]
-function ServerBuildingService:RecolorCeiling(
-	player: Player,
-	requests: { CellRequest },
-	floor: number,
-	color: any
-): (number, string?)
-	local plot = ServerPlotService:GetPlayerPlot(player)
-	if not plot then
-		return 0, "no plot"
-	end
-	local grid = plot:GetGrid()
-	if floor < 1 or floor % 1 ~= 0 or #requests < 1 or #requests > grid.Width * grid.Depth then
-		return 0, "invalid request"
-	end
-
-	local recolored, seen = 0, {}
-	local changes: { CeilingChange } = {}
-	for _, request in requests do
-		local key = `{request.X},{request.Z}`
-		if seen[key] then
-			continue
-		end
-		seen[key] = true
-
-		local before = copyCeiling(grid:GetCeiling(request.X, request.Z, floor))
-		if not before then
-			continue
-		end
-		local cleanColor = SharedColorService:SanitizeMaterialColor("Ceiling", before.Material, color)
-		if cleanColor == before.Color then
-			continue
-		end
-
-		grid:SetCeiling(request.X, request.Z, floor, before.TopOffset, before.Material, cleanColor)
-		renderCeiling(plot, request.X, request.Z, floor, before.TopOffset, before.Material, cleanColor)
-		local floorState = copyFloor(grid, request.X, request.Z, floor + 1)
-		table.insert(changes, {
-			X = request.X,
-			Z = request.Z,
-			Floor = floor,
-			BeforeCeiling = before,
-			AfterCeiling = copyCeiling(grid:GetCeiling(request.X, request.Z, floor)),
-			BeforeFloor = floorState,
-			AfterFloor = floorState,
-		})
-		recolored += 1
-	end
-
-	if recolored > 0 then
-		pushHistory(player, { Kind = "Ceiling", Changes = changes })
-		persist(plot)
-	end
-	return recolored, nil
-end
-
---[[
 Removes a ceiling and clears the painted tile that rested on it one level above.
 ]]
 function ServerBuildingService:RemoveCeiling(player: Player, requests: { CellRequest }, floor: number): number
@@ -1292,8 +1104,6 @@ paletteRemote.OnServerInvoke = function(player, action, name, colors, propagate,
 		return ServerBuildingService:ApplyPalette(player, name)
 	elseif action == "info" then
 		return ServerBuildingService:PaletteInfo(player, name)
-	elseif action == "clear" then
-		return ServerBuildingService:ClearPalette(player, name)
 	end
 	return false, "bad request"
 end
@@ -1320,11 +1130,6 @@ ceilingRemote.OnServerInvoke = function(player, action, target, second, third, f
 			return 0, "bad request"
 		end
 		return ServerBuildingService:PlaceCeiling(player, target, second, third, fourth)
-	elseif action == "recolor" then
-		if not isRequestList(target, isCellRequest) or not isGridInteger(second) then
-			return 0, "bad request"
-		end
-		return ServerBuildingService:RecolorCeiling(player, target, second, third)
 	elseif action == "surface" then
 		if not isRequestList(target, isCellRequest) or not isGridInteger(second) then
 			return 0, "bad request"
