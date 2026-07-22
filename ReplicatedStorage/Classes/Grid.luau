@@ -46,8 +46,8 @@ export type Placement = {
 -- {nameIndex, x, z, floor, rot, colorSetIndex?, linked?}. `Palette` here is the catalog
 -- NAME dedupe and predates colours; colours live in ColorSets.
 export type SavedPlacement = { number }
--- Painted floor material (index into Config.Materials.Floor), per floor + cell. Grass
--- is implicit on the plot base but stored when explicitly painted on an upper floor.
+-- Painted floor override (index into Config.Materials.Floor), per floor + cell. Grass
+-- is implicit on the plot base; upper floors inherit from their supporting ceiling.
 -- Color is a packed 24-bit tint, or nil for the material's default (see Config/Materials).
 export type FloorEntry = { Floor: number, X: number, Z: number, Material: number, Color: number? }
 -- A ceiling capping one build floor at a cell. TopOffset is its top surface's height
@@ -79,7 +79,7 @@ export type Grid = typeof(setmetatable(
 		_placements: { [number]: Placement },
 		_cellIndex: { [string]: number }, -- cell key -> placement id
 		_edgeIndex: { [string]: number }, -- edge key -> placement id
-		_floors: { [string]: FloorEntry }, -- cell key -> painted floor material
+		_floors: { [string]: FloorEntry }, -- cell key -> painted floor override
 		_ceilings: { [string]: CeilingEntry }, -- "floor:x,z" -> ceiling
 		_nextId: number,
 	},
@@ -198,8 +198,8 @@ end
 
 -- ===== Floor material layer =================================================
 
---[[Sets a cell's painted floor material. Material 0 removes the overlay; base-floor
-grass remains implicit, while upper-floor grass must be stored so it can render.]]
+--[[Sets a cell's painted floor override. Material 0 restores the floor inherited from
+the plot base or supporting ceiling. Base-floor default grass also remains implicit.]]
 function Grid:SetFloorMaterial(x: number, z: number, floor: number, material: number, color: number?)
 	local key = Grid.cellKey(x, z, floor)
 	-- A tinted base-floor grass cell still has to be stored, since it no longer matches

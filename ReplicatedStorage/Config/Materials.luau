@@ -3,9 +3,9 @@ Material palettes for flooring and ceilings. Each is an ordered list of entries.
 INDEX is the stable id stored in saves, so this list is APPEND-ONLY: never reorder or
 remove entries or you'll corrupt existing builds.
 
-Index 1 of Floor is the default ("grass") that every unpainted base cell shows. On
-upper floors, grass is stored and rendered like any other selected material. Index 1
-of Ceiling is the default ceiling underside.
+Index 1 of Floor is the default ("grass") that every unpainted base cell shows. Upper
+floors inherit the material and colour of their supporting ceiling until painted. Each
+ceiling entry points at the matching floor material so both faces start out identical.
 
 Each entry carries the Enum.Material name (also its display label) and Color, the
 authored default tint an uncoloured cell renders as. A cell's tint is stored per-cell in
@@ -26,12 +26,14 @@ return {
 		{ Material = "Slate", Color = Color3.fromRGB(96, 104, 112) },
 		{ Material = "Sand", Color = Color3.fromRGB(216, 198, 154) },
 		{ Material = "Brick", Color = Color3.fromRGB(152, 84, 68) },
+		{ Material = "Plaster", Color = Color3.fromRGB(228, 226, 220), Hidden = true },
+		{ Material = "SmoothPlastic", Color = Color3.fromRGB(200, 200, 204), Hidden = true },
 	},
 
 	Ceiling = {
-		{ Material = "Plaster", Color = Color3.fromRGB(228, 226, 220) },
-		{ Material = "WoodPlanks", Color = Color3.fromRGB(154, 112, 72) },
-		{ Material = "Concrete", Color = Color3.fromRGB(150, 150, 146) },
-		{ Material = "SmoothPlastic", Color = Color3.fromRGB(200, 200, 204) },
+		{ Material = "Plaster", Color = Color3.fromRGB(228, 226, 220), FloorMaterial = 9 },
+		{ Material = "WoodPlanks", Color = Color3.fromRGB(154, 112, 72), FloorMaterial = 2 },
+		{ Material = "Concrete", Color = Color3.fromRGB(150, 150, 146), FloorMaterial = 3 },
+		{ Material = "SmoothPlastic", Color = Color3.fromRGB(200, 200, 204), FloorMaterial = 10 },
 	},
 }

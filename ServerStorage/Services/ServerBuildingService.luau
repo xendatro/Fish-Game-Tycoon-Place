@@ -264,7 +264,7 @@ local function derender(plot, placementId)
 	end
 end
 
---[[Returns (creating if needed) the folder holding a plot's painted floor tiles.]]
+--[[Returns (creating if needed) the folder holding a plot's rendered floor surfaces.]]
 local function getFloorContainer(plot): Folder
 	local container = plot.Model:FindFirstChild("Floor")
 	if not container then
@@ -275,32 +275,48 @@ local function getFloorContainer(plot): Folder
 	return container
 end
 
---[[
-Returns a painted floor cell's tile descriptor for meshing - its material index and the
-world Y of its supporting surface - or nil if the cell has no explicit tile. Elevated
-grass is an explicit tile; base-floor grass remains the plot's implicit default.
-]]
-local function floorTileAt(
+--[[Returns the floor supplied by the plot base or supporting ceiling.]]
+local function inheritedFloorAt(
 	grid,
 	x: number,
 	z: number,
 	floor: number
 ): ({ Material: number, Color: number?, SurfaceY: number }?)
-	local entry = grid:GetFloorEntry(x, z, floor)
-	if not entry then
-		return nil
-	end
 	if floor == 1 then
-		return { Material = entry.Material, Color = entry.Color, SurfaceY = grid.Origin.Y }
+		return {
+			Material = 1,
+			SurfaceY = grid.Origin.Y,
+		}
 	end
 	local ceiling = grid:GetCeiling(x, z, floor - 1)
 	if not ceiling then
 		return nil
 	end
+	local ceilingMaterial = Materials.Ceiling[ceiling.Material]
 	return {
-		Material = entry.Material,
-		Color = entry.Color,
+		Material = ceilingMaterial.FloorMaterial,
+		Color = ceiling.Color,
 		SurfaceY = grid.Origin.Y + SharedBuildingService:GetLevelBaseOffset(floor),
+	}
+end
+
+--[[Returns a floor cell's effective surface. An explicit paint entry wins.]]
+local function floorTileAt(
+	grid,
+	x: number,
+	z: number,
+	floor: number
+): ({ Material: number, Color: number?, SurfaceY: number, Override: boolean }?)
+	local inherited = inheritedFloorAt(grid, x, z, floor)
+	if not inherited then
+		return nil
+	end
+	local entry = grid:GetFloorEntry(x, z, floor)
+	return {
+		Material = if entry then entry.Material else inherited.Material,
+		Color = if entry then entry.Color else inherited.Color,
+		SurfaceY = inherited.SurfaceY,
+		Override = entry ~= nil,
 	}
 end
 
@@ -346,6 +362,7 @@ local function remeshFloor(plot, floor: number)
 					and other.Material == tile.Material
 					and other.Color == tile.Color
 					and other.SurfaceY == tile.SurfaceY
+					and other.Override == tile.Override
 			end
 
 			local w = 1
@@ -375,17 +392,20 @@ local function remeshFloor(plot, floor: number)
 			local part = Instance.new("Part")
 			part.Anchored = true
 			part.CanCollide = false
+			part.CanTouch = false
 			part.Size = Vector3.new(w * cell, Building.FLOOR_THICKNESS, h * cell)
 			part.Material = (Enum.Material :: any)[Materials.Floor[tile.Material].Material]
 			part.Color = SharedColorService:MaterialColor("Floor", tile.Material, tile.Color)
-			-- The overlay's bottom rests directly on its supporting surface.
+			-- Half the thin surface sinks into its support, leaving only the configured
+			-- z-fighting offset above the structural surface.
 			part.CFrame = CFrame.new(
 				grid.Origin.X + (x + w / 2) * cell,
-				tile.SurfaceY + Building.FLOOR_THICKNESS / 2,
+				tile.SurfaceY + Building.FLOOR_SURFACE_OFFSET - Building.FLOOR_THICKNESS / 2,
 				grid.Origin.Z + (z + h / 2) * cell
 			)
 			part:SetAttribute("FloorLevel", floor)
 			part:SetAttribute("MaterialIndex", tile.Material)
+			part:SetAttribute("FloorOverride", tile.Override)
 			-- Stamped so the client's recolour tool can read a tile's current tint.
 			part:SetAttribute("TintColor", tile.Color)
 			part.Parent = container
@@ -462,17 +482,22 @@ local function emptyPlot(plot)
 	local base = plot.Model:FindFirstChild("Plot") :: BasePart
 	clearRendered(plot)
 	plot:SetGrid(Grid.new(base))
+	base.Transparency = 1
+	remeshFloor(plot, 1)
 end
 
 local function renderGrid(plot)
 	local grid = plot:GetGrid()
+	local base = plot.Model:FindFirstChild("Plot") :: BasePart
+	base.Transparency = 1
 	for _, placement in grid:GetPlacements() do
 		render(plot, placement)
 	end
+	local floors = { [1] = true }
 	for _, ceiling in grid:GetCeilings() do
 		renderCeiling(plot, ceiling.X, ceiling.Z, ceiling.Floor, ceiling.TopOffset, ceiling.Material, ceiling.Color)
+		floors[ceiling.Floor + 1] = true
 	end
-	local floors = {}
 	for _, floorEntry in grid:GetFloorEntries() do
 		floors[floorEntry.Floor] = true
 	end
@@ -948,6 +973,125 @@ function ServerBuildingService:ApplyPalette(player: Player, name: string): (numb
 	return changed, if changed > 0 then nil else "everything already matches"
 end
 
+--[[Paints floor overrides and remeshes each changed batch once. Material 0 restores
+the floor supplied by the plot base or supporting ceiling.]]
+function ServerBuildingService:PaintFloor(
+	player: Player,
+	requests: { CellRequest },
+	floor: number,
+	materialIndex: number,
+	color: any
+): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
+	if floor < 1 or floor % 1 ~= 0 then
+		return 0, "invalid floor"
+	end
+	if materialIndex < 0 or materialIndex > #Materials.Floor then
+		return 0, "invalid material"
+	end
+	local grid = plot:GetGrid()
+	if #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0, "invalid drag"
+	end
+
+	local cleanColor = if materialIndex > 0
+		then SharedColorService:SanitizeMaterialColor("Floor", materialIndex, color)
+		else nil
+	local painted, seen = 0, {}
+	local changes: { FloorChange } = {}
+	for _, request in requests do
+		local key = `{request.X},{request.Z}`
+		local entry = grid:GetFloorEntry(request.X, request.Z, floor)
+		local surface = floorTileAt(grid, request.X, request.Z, floor)
+		local valid = not seen[key]
+			and grid:IsInBounds(request.X, request.Z)
+			and (if materialIndex == 0
+				then entry ~= nil
+				else surface ~= nil
+					and (surface.Material ~= materialIndex or surface.Color ~= cleanColor)
+					and SharedBuildingService:CanPaintFloor(grid, request.X, request.Z, floor))
+		seen[key] = true
+		if not valid then
+			continue
+		end
+
+		local before = copyFloor(grid, request.X, request.Z, floor)
+		local inherited = inheritedFloorAt(grid, request.X, request.Z, floor)
+		if materialIndex == 0
+			or (inherited and inherited.Material == materialIndex and inherited.Color == cleanColor)
+		then
+			grid:SetFloorMaterial(request.X, request.Z, floor, 0)
+		else
+			grid:SetFloorMaterial(request.X, request.Z, floor, materialIndex, cleanColor)
+		end
+		table.insert(changes, {
+			X = request.X,
+			Z = request.Z,
+			Floor = floor,
+			Before = before,
+			After = copyFloor(grid, request.X, request.Z, floor),
+		})
+		painted += 1
+	end
+	if painted > 0 then
+		pushHistory(player, { Kind = "Floor", Changes = changes })
+		remeshFloor(plot, floor)
+		persist(plot)
+	end
+	return painted, if painted > 0 then nil else "no changed floor cells"
+end
+
+--[[Places ceilings and renders the matching inherited floor on top. The two faces
+start with the same material and colour; later floor paint is stored as an override.]]
+function ServerBuildingService:PlaceCeiling(
+	player: Player,
+	requests: { CellRequest },
+	floor: number,
+	materialIndex: number,
+	color: any
+): (number, string?)
+	local plot = ServerPlotService:GetPlayerPlot(player)
+	if not plot then
+		return 0, "no plot"
+	end
+	if floor < 1 or floor % 1 ~= 0 then
+		return 0, "invalid floor"
+	end
+	if materialIndex < 1 or materialIndex > #Materials.Ceiling then
+		return 0, "invalid material"
+	end
+	local grid = plot:GetGrid()
+	if #requests < 1 or #requests > grid.Width * grid.Depth then
+		return 0, "invalid drag"
+	end
+
+	local cleanColor = SharedColorService:SanitizeMaterialColor("Ceiling", materialIndex, color)
+	local placed = SharedBuildingService:FillCeilings(grid, requests, floor, materialIndex, cleanColor)
+	local changes: { CeilingChange } = {}
+	for _, result in placed do
+		renderCeiling(plot, result.X, result.Z, floor, result.TopOffset, materialIndex, cleanColor)
+		local floorState = copyFloor(grid, result.X, result.Z, floor + 1)
+		table.insert(changes, {
+			X = result.X,
+			Z = result.Z,
+			Floor = floor,
+			BeforeCeiling = nil,
+			AfterCeiling = copyCeiling(grid:GetCeiling(result.X, result.Z, floor)),
+			BeforeFloor = floorState,
+			AfterFloor = floorState,
+		})
+	end
+	if #placed > 0 then
+		pushHistory(player, { Kind = "Ceiling", Changes = changes })
+		remeshFloor(plot, floor + 1)
+		persist(plot)
+	end
+	return #placed, if #placed > 0 then nil else "no available floor cells"
+end
+
 --[[
 Retints one structural divider: the ceiling capping `ceilingFloor` and the floor tile
 resting on top of it, which are the two faces of the same slab. Color 1 is the ceiling
@@ -984,7 +1128,6 @@ function ServerBuildingService:PaintSurface(
 		seen[key] = true
 
 		local ceiling = if ceilingFloor >= 1 then copyCeiling(grid:GetCeiling(request.X, request.Z, ceilingFloor)) else nil
-		local tile = grid:GetFloorEntry(request.X, request.Z, floorLevel)
 		local beforeFloor = copyFloor(grid, request.X, request.Z, floorLevel)
 
 		local newCeiling = ceiling
@@ -998,10 +1141,16 @@ function ServerBuildingService:PaintSurface(
 		end
 
 		local afterFloor = beforeFloor
-		if tile then
-			local tint = SharedColorService:SanitizeMaterialColor("Floor", tile.Material, colors[2])
-			if tint ~= tile.Color then
-				grid:SetFloorMaterial(request.X, request.Z, floorLevel, tile.Material, tint)
+		local floorSurface = floorTileAt(grid, request.X, request.Z, floorLevel)
+		if floorSurface then
+			local tint = SharedColorService:SanitizeMaterialColor("Floor", floorSurface.Material, colors[2])
+			if tint ~= floorSurface.Color then
+				local inherited = inheritedFloorAt(grid, request.X, request.Z, floorLevel)
+				if inherited and inherited.Material == floorSurface.Material and inherited.Color == tint then
+					grid:SetFloorMaterial(request.X, request.Z, floorLevel, 0)
+				else
+					grid:SetFloorMaterial(request.X, request.Z, floorLevel, floorSurface.Material, tint)
+				end
 				afterFloor = copyFloor(grid, request.X, request.Z, floorLevel)
 			end
 		end
@@ -1175,6 +1324,15 @@ ServerPlotService.PlotReleased:Connect(function(player, plotNumber)
 	emptyPlot(plot)
 	Histories[player] = nil
 end)
+
+-- Open plots still show their default grass through the floor renderer. The authored
+-- Plot part remains the invisible collision and grid reference beneath it.
+for _, plotNumber in ServerPlotService:GetOpenPlots() do
+	local plot = ServerPlotService:GetPlot(plotNumber)
+	if plot then
+		emptyPlot(plot)
+	end
+end
 
 for _, player in Players:GetPlayers() do
 	local plot = ServerPlotService:GetPlayerPlot(player)

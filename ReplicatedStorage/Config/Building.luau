@@ -21,9 +21,10 @@ Building.WALL_HEIGHT = 8
 -- (which becomes the next build floor's surface); its thickness hangs below that line.
 Building.CEILING_THICKNESS = 1
 
--- Painted floor overlays sit on the plot or a ceiling. Delete-drag grid visibility is
--- temporary UX tuning and can be switched back on without changing input logic.
-Building.FLOOR_THICKNESS = 0.2
+-- Floor surfaces overlap their supporting plot or ceiling by half their thickness, so
+-- only this small offset shows above it. This prevents z-fighting without raising builds.
+Building.FLOOR_THICKNESS = 0.02
+Building.FLOOR_SURFACE_OFFSET = 0.01
 Building.SHOW_GRID_DURING_DELETE_DRAG = false
 
 -- Parts above the active build-camera floor remain visible but do not block build

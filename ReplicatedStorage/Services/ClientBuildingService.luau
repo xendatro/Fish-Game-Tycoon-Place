@@ -163,7 +163,7 @@ local function surfaceColor(kind: "Floor" | "Ceiling"): number?
 	return PlaceColors[if kind == "Ceiling" then 1 else 2]
 end
 
---[[Requests painting a cell's floor material. Material 0 removes an overlay.]]
+--[[Requests painting a cell's floor material. Material 0 restores its default.]]
 function ClientBuildingService:RequestPaint(x: number, z: number, floor: number, materialIndex: number): (boolean, string?)
 	local color = if materialIndex > 0 then surfaceColor("Floor") else nil
 	local count, reason = paintRemote:InvokeServer({ { X = x, Z = z } }, floor, materialIndex, color)
@@ -784,7 +784,8 @@ local function existingDeleteCells(state: DeleteDragState, cells: { CellRequest 
 			end
 			continue
 		end
-		if floorPartAt(container, grid, cell.X, cell.Z, state.Floor) then
+		local part = floorPartAt(container, grid, cell.X, cell.Z, state.Floor)
+		if part and part:GetAttribute("FloorOverride") == true then
 			table.insert(existing, cell)
 		end
 	end
@@ -811,7 +812,7 @@ local function updateDeleteCells(
 		)
 		indicator.CFrame = CFrame.new(
 			centre.X,
-			y + (if ceiling then -Building.CEILING_THICKNESS / 2 else Building.FLOOR_THICKNESS + 0.05),
+			y + (if ceiling then -Building.CEILING_THICKNESS / 2 else Building.FLOOR_SURFACE_OFFSET + 0.05),
 			centre.Z
 		)
 		local outline = indicator:FindFirstChild("Outline") :: SelectionBox
@@ -846,6 +847,18 @@ local function updateDeleteHover()
 	end
 	local grid = Grid.new(base)
 	local x, z = grid:WorldToCell(hitPosition)
+	if target:GetAttribute("FloorOverride") ~= true then
+		if floor > 1 then
+			local ceilings = base.Parent:FindFirstChild("Ceilings")
+			local slab = ceilings and ceilings:FindFirstChild(Grid.ceilingKey(x, z, floor - 1))
+			if slab then
+				setDeleteHighlights({ slab :: any })
+				return
+			end
+		end
+		hideDeleteHighlight()
+		return
+	end
 	updateDeleteCells(grid, "Floor", floor, {
 		{ X = math.clamp(x, 0, grid.Width - 1), Z = math.clamp(z, 0, grid.Depth - 1) },
 	})
@@ -1081,7 +1094,7 @@ local function updateTilePreview()
 			local valid = SharedBuildingService:CanPaintFloor(grid, cell.X, cell.Z, targetFloor)
 			setTilePreview(
 				previewCount,
-				CFrame.new(centre.X, grid.Origin.Y + topOffset + Building.FLOOR_THICKNESS + 0.05, centre.Z),
+				CFrame.new(centre.X, grid.Origin.Y + topOffset + Building.FLOOR_SURFACE_OFFSET + 0.05, centre.Z),
 				Vector3.new(Building.CELL_SIZE, 0.1, Building.CELL_SIZE),
 				valid,
 				false
@@ -1331,8 +1344,8 @@ local function onClick()
 		pickTarget()
 		return
 	end
-	-- Delete mode prioritises rendered placements/ceilings under the cursor. A rendered
-	-- floor overlay is removed independently from its supporting ceiling.
+	-- Delete mode prioritises placements and ceiling slabs. A painted floor reverts to
+	-- its inherited look first; an inherited upper floor targets its supporting ceiling.
 	if deleteMode then
 		local target, hitPosition = deleteRaycast()
 		local model = findPlacementModel(target)
@@ -1363,6 +1376,15 @@ local function onClick()
 		local x, z = math.clamp(rawX, 0, grid.Width - 1), math.clamp(rawZ, 0, grid.Depth - 1)
 		local floorLevel = target:GetAttribute("FloorLevel")
 		local level = if typeof(floorLevel) == "number" then floorLevel else currentFloor
+		if typeof(floorLevel) == "number" and target:GetAttribute("FloorOverride") ~= true then
+			if floorLevel > 1 then
+				local ok = ClientBuildingService:RequestRemoveCeiling(x, z, floorLevel - 1)
+				refreshStatus(if ok then "removed ceiling" else "remove failed")
+			else
+				refreshStatus("nothing to delete")
+			end
+			return
+		end
 		local ok = ClientBuildingService:RequestPaint(x, z, level, 0)
 		refreshStatus(if ok then `removed floor ({x},{z})` else "nothing to delete")
 		return
@@ -1445,6 +1467,18 @@ local function beginDeleteDrag(): boolean
 	end
 	local grid = base and Grid.new(base)
 	local x, z
+	if not ceiling and target:GetAttribute("FloorOverride") ~= true then
+		if floor <= 1 then
+			return false
+		end
+		local rawX, rawZ = grid:WorldToCell(hitPosition)
+		x, z = math.clamp(rawX, 0, grid.Width - 1), math.clamp(rawZ, 0, grid.Depth - 1)
+		local ceilings = base.Parent:FindFirstChild("Ceilings")
+		ceiling = ceilings and ceilings:FindFirstChild(Grid.ceilingKey(x, z, floor - 1)) :: BasePart?
+		if not ceiling then
+			return false
+		end
+	end
 	if ceiling then
 		x, z, floor = ceiling:GetAttribute("GridX"), ceiling:GetAttribute("GridZ"), ceiling:GetAttribute("Floor")
 	else
@@ -1867,6 +1901,9 @@ local function buildDebugUI()
 	end
 
 	for index, material in Materials.Floor do
+		if material.Hidden then
+			continue
+		end
 		addButton(floorPage, material.Material, function()
 			clearModes()
 			paintMode = true
