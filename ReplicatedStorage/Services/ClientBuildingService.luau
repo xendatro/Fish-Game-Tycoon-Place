@@ -26,11 +26,19 @@ local Materials = require(ReplicatedStorage.Config.Materials)
 local SharedBuildingService = require(ReplicatedStorage.Services.SharedBuildingService)
 local SharedColorService = require(ReplicatedStorage.Services.SharedColorService)
 local DataSaveService = require(ReplicatedStorage.Services.DataSaveService)
+local BuildingAnimator = require(ReplicatedStorage.Services.ClientBuildingAnimator)
 local Signal = require(ReplicatedStorage.Classes.Signal)
 
 local DELETE_FILL_TRANSPARENCY = 0.85
 local DELETE_COLOR = Color3.fromRGB(220, 60, 60)
 local RECOLOR_COLOR = Color3.fromRGB(120, 190, 255)
+
+-- Preview ghost feel. The ghost glides toward its target cell instead of snapping, which
+-- also smoothly animates rotation, and idles with a faint hover so it reads as a hologram.
+-- Smoothing is framerate-independent: alpha = 1 - exp(-speed * dt).
+local GHOST_SMOOTH_SPEED = 22
+local GHOST_BOB_SPEED = 3.2
+local GHOST_BOB_AMP = 0.12
 
 -- Remotes authored in Studio under ReplicatedStorage.Communication.Building.
 local BuildingRemotes = ReplicatedStorage:WaitForChild("Communication"):WaitForChild("Building")
@@ -257,6 +265,35 @@ end
 -- Live preview ("ghost") of the selected asset, following the cursor.
 local previewModel: Model? = nil
 local extraPreviewModels: { Model } = {}
+
+-- Smoothed pose of the single-placement ghost. `ghostVisible` false means it was parked or
+-- freshly rebuilt last frame, so the next frame snaps rather than gliding in from far away.
+local ghostCurrentCF: CFrame? = nil
+local ghostVisible = false
+
+--[[Glides the ghost toward `targetCF` and applies the idle hover. Snaps on first appearance
+so it doesn't streak across the map from its parked position.]]
+local function applyGhostMotion(model: Model, targetCF: CFrame, dt: number)
+	local current = ghostCurrentCF
+	if current == nil or not ghostVisible then
+		current = targetCF
+	else
+		current = current:Lerp(targetCF, 1 - math.exp(-GHOST_SMOOTH_SPEED * dt))
+	end
+	ghostCurrentCF = current
+	ghostVisible = true
+	local bob = math.sin(os.clock() * GHOST_BOB_SPEED) * GHOST_BOB_AMP
+	model:PivotTo(current * CFrame.new(0, bob, 0))
+end
+
+--[[Parks the ghost out of sight and resets its glide so it snaps on next appearance.]]
+local function parkGhost()
+	ghostVisible = false
+	ghostCurrentCF = nil
+	if previewModel then
+		previewModel:PivotTo(CFrame.new(0, -1000, 0))
+	end
+end
 
 -- Per-piece hitboxes (pooled). The parts are invisible; each carries a SelectionBox
 -- outline that shows red only on the pieces that actually collide / are out of bounds.
@@ -991,6 +1028,9 @@ local function rebuildPreview()
 	end
 	table.clear(extraPreviewModels)
 
+	ghostVisible = false
+	ghostCurrentCF = nil
+
 	if not buildMode or deleteMode or paintMode or ceilingMode or paintObjectMode or pickMode or not selectedAsset then
 		return
 	end
@@ -1123,9 +1163,9 @@ local function updateTilePreview()
 	end
 end
 
---[[Snaps the preview ghost + validity indicators to the cell under the cursor
+--[[Glides the preview ghost + snaps validity indicators to the cell under the cursor
 each frame, or parks them out of sight when the cursor isn't over the world.]]
-local function updatePreview()
+local function updatePreview(dt: number)
 	if paintMode or ceilingMode then
 		hideIndicators()
 		updateTilePreview()
@@ -1145,13 +1185,16 @@ local function updatePreview()
 		local targetFloor = if dragState then dragState.Floor else currentFloor
 		local x, z, hitPosition = cellUnderCursor(grid, targetFloor, false)
 		if x == nil or z == nil or hitPosition == nil then
-			previewModel:PivotTo(CFrame.new(0, -1000, 0))
+			parkGhost()
 			hideExtraPreviews()
 			hideIndicators()
 			return
 		end
 		local name = if dragState and dragState.Name then dragState.Name else selectedAsset
 		local requests
+		-- A single ghost (no drag row) glides and idles; a drag's copies snap so the row it
+		-- would place reads exactly, cell for cell.
+		local glide = not dragState
 		if dragState and dragState.Mode == "Item" then
 			dragState.LastX, dragState.LastZ = x, z
 			requests = dragPlacements(dragState, x, z)
@@ -1177,6 +1220,11 @@ local function updatePreview()
 					request.Floor,
 					entry and entry.Type
 				)
+				if glide and index == 1 then
+					applyGhostMotion(model, model:GetPivot(), dt)
+				elseif index == 1 then
+					ghostVisible = false
+				end
 			end
 		end
 		for index = #requests, #extraPreviewModels do
@@ -1189,7 +1237,7 @@ local function updatePreview()
 		return
 	end
 	-- No valid target: park the ghost far below the map and hide indicators.
-	previewModel:PivotTo(CFrame.new(0, -1000, 0))
+	parkGhost()
 	hideExtraPreviews()
 	hideIndicators()
 	hideBuildPlane()
@@ -1350,7 +1398,17 @@ local function onClick()
 		local target, hitPosition = deleteRaycast()
 		local model = findPlacementModel(target)
 		if model then
+			-- Detach a display copy first: the real model is destroyed by replication the
+			-- moment the server confirms, so we'd have nothing left to poof otherwise.
+			local ghost = BuildingAnimator:CloneForPoof(model)
 			local ok = ClientBuildingService:RequestRemove(model:GetAttribute("PlacementId") :: number)
+			if ghost then
+				if ok then
+					BuildingAnimator:PoofClone(ghost)
+				else
+					ghost:Destroy()
+				end
+			end
 			refreshStatus(if ok then "removed" else "remove failed")
 			return
 		end
@@ -1526,10 +1584,28 @@ local function finishDeleteDrag()
 			return
 		end
 		local placementIds = {}
+		-- Clone the doomed models up front (a modest cap keeps a huge sweep from spawning a
+		-- swarm of effects), then poof the copies once the server confirms the removal.
+		local ghosts = {}
 		for _, model in models do
 			table.insert(placementIds, model:GetAttribute("PlacementId"))
+			if #ghosts < 12 then
+				local ghost = BuildingAnimator:CloneForPoof(model)
+				if ghost then
+					table.insert(ghosts, ghost)
+				end
+			end
 		end
 		local removed = removeRemote:InvokeServer(placementIds)
+		for index, ghost in ghosts do
+			if removed > 0 then
+				task.delay((index - 1) * 0.03, function()
+					BuildingAnimator:PoofClone(ghost)
+				end)
+			else
+				ghost:Destroy()
+			end
+		end
 		refreshStatus(if removed > 0 then `removed {removed}/{#placementIds}` else "remove failed")
 		return
 	end
@@ -1647,9 +1723,7 @@ local function setBuildMode(enabled: boolean)
 		paintDragState = nil
 		freeCameraMode = false
 		cameraController:SetEnabled(false)
-		if previewModel then
-			previewModel:PivotTo(CFrame.new(0, -1000, 0))
-		end
+		parkGhost()
 		hideExtraPreviews()
 		hideIndicators()
 		hideTilePreview()
@@ -2009,7 +2083,7 @@ end
 
 buildDebugUI()
 
-RunService.RenderStepped:Connect(function()
+RunService.RenderStepped:Connect(function(dt)
 	if not buildMode then
 		return
 	end
@@ -2041,7 +2115,7 @@ RunService.RenderStepped:Connect(function()
 		updateDeleteHighlight()
 	else
 		hideDeleteHighlight()
-		updatePreview()
+		updatePreview(dt)
 	end
 end)
 
