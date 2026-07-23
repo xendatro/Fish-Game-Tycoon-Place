@@ -27,6 +27,14 @@ Building.FLOOR_THICKNESS = 0.02
 Building.FLOOR_SURFACE_OFFSET = 0.01
 Building.SHOW_GRID_DURING_DELETE_DRAG = false
 
+-- Shared timing for the paired ceiling/floor placement effect. The server holds the
+-- remeshed upper floor until this cascade has landed, so these values must stay shared.
+Building.CEILING_ANIMATION_DURATION = 0.26
+Building.CEILING_ANIMATION_STAGGER = 0.035
+Building.ANIMATION_CASCADE_REF = 6
+Building.ANIMATION_CASCADE_MAX_SPEEDUP = 3
+Building.ANIMATION_HANDOFF_DELAY = 0.25
+
 -- Parts above the active build-camera floor remain visible but do not block build
 -- raycasts. Roblox transparency uses 0 = opaque and 1 = invisible.
 Building.HIDDEN_FLOOR_TRANSPARENCY = 0.75

@@ -56,6 +56,7 @@ type HistoryState = { Undo: { HistoryEntry }, Redo: { HistoryEntry } }
 
 local Histories: { [Player]: HistoryState } = {}
 local AssignedPlots = {}
+local FloorRemeshVersions = setmetatable({}, { __mode = "k" })
 
 local function isFiniteNumber(value: any): boolean
 	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -200,7 +201,7 @@ asset model, rotates it, and aligns it to its floor or ceiling surface at its pi
 This is the basic content path. Each level has a deterministic configured offset;
 ceilings and flooring use their own render paths below.
 ]]
-local function render(plot, placement)
+local function render(plot, placement, bulk: boolean?)
 	local model = SharedBuildingService:GetModel(placement.Name)
 	if not model then
 		return
@@ -208,6 +209,11 @@ local function render(plot, placement)
 
 	local grid = plot:GetGrid()
 	local clone = model:Clone()
+	-- `bulk` marks a load/reset render so the client's animator leaves it be instead of
+	-- popping it in - set before parenting so it travels with the instance's first replication.
+	if bulk then
+		clone:SetAttribute("BulkRendered", true)
+	end
 	-- Stamp the placement data so clients can rebuild the authoritative grid for previews.
 	clone:SetAttribute("PlacementId", placement.Id)
 	clone:SetAttribute("AssetName", placement.Name)
@@ -413,6 +419,19 @@ local function remeshFloor(plot, floor: number)
 	end
 end
 
+--[[Time needed for the client to land a full ceiling batch. Holding the upper-floor
+remesh for this window keeps it from covering the paired ceiling/floor drop.]]
+local function ceilingAnimationTime(count: number): number
+	local factor = math.clamp(
+		count / Building.ANIMATION_CASCADE_REF,
+		1,
+		Building.ANIMATION_CASCADE_MAX_SPEEDUP
+	)
+	return Building.CEILING_ANIMATION_DURATION / factor
+		+ math.max(0, count - 1) * Building.CEILING_ANIMATION_STAGGER / factor
+		+ Building.ANIMATION_HANDOFF_DELAY
+end
+
 --[[Returns (creating if needed) the folder holding a plot's ceiling slabs.]]
 local function getCeilingContainer(plot): Folder
 	local container = plot.Model:FindFirstChild("Ceilings")
@@ -433,7 +452,8 @@ local function renderCeiling(
 	floor: number,
 	topOffset: number,
 	materialIndex: number,
-	color: number?
+	color: number?,
+	bulk: boolean?
 )
 	local container = getCeilingContainer(plot)
 	local key = Grid.ceilingKey(x, z, floor)
@@ -448,6 +468,9 @@ local function renderCeiling(
 		slab.Name = key
 		slab.Anchored = true
 		slab.Size = Vector3.new(Building.CELL_SIZE, Building.CEILING_THICKNESS, Building.CELL_SIZE)
+		if bulk then
+			slab:SetAttribute("BulkRendered", true)
+		end
 	end
 	slab:SetAttribute("GridX", x)
 	slab:SetAttribute("GridZ", z)
@@ -491,11 +514,11 @@ local function renderGrid(plot)
 	local base = plot.Model:FindFirstChild("Plot") :: BasePart
 	base.Transparency = 1
 	for _, placement in grid:GetPlacements() do
-		render(plot, placement)
+		render(plot, placement, true)
 	end
 	local floors = { [1] = true }
 	for _, ceiling in grid:GetCeilings() do
-		renderCeiling(plot, ceiling.X, ceiling.Z, ceiling.Floor, ceiling.TopOffset, ceiling.Material, ceiling.Color)
+		renderCeiling(plot, ceiling.X, ceiling.Z, ceiling.Floor, ceiling.TopOffset, ceiling.Material, ceiling.Color, true)
 		floors[ceiling.Floor + 1] = true
 	end
 	for _, floorEntry in grid:GetFloorEntries() do
@@ -1086,8 +1109,19 @@ function ServerBuildingService:PlaceCeiling(
 	end
 	if #placed > 0 then
 		pushHistory(player, { Kind = "Ceiling", Changes = changes })
-		remeshFloor(plot, floor + 1)
 		persist(plot)
+		local versions = FloorRemeshVersions[plot]
+		if not versions then
+			versions = {}
+			FloorRemeshVersions[plot] = versions
+		end
+		local floorLevel = floor + 1
+		local version = (versions[floorLevel] or 0) + 1
+		versions[floorLevel] = version
+		task.wait(ceilingAnimationTime(#placed))
+		if ServerPlotService:GetPlayerPlot(player) == plot and versions[floorLevel] == version then
+			remeshFloor(plot, floorLevel)
+		end
 	end
 	return #placed, if #placed > 0 then nil else "no available floor cells"
 end

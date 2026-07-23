@@ -477,10 +477,19 @@ function SharedBuildingService:CanPlace(
 	end
 	local cells, edges = self:ResolveOccupancy(name, x, z, floor, rotation)
 
-	-- Bounds: every cell of the (rotated) footprint must be inside the plot.
-	for _, coord in computeCellCoords(entry, x, z, rotation) do
-		if not grid:IsInBounds(coord[1], coord[2]) then
-			return false, "out of bounds"
+	-- Walls are bounded by their edge segments, not their anchor cell. The anchor may sit
+	-- one cell outside the plot when its facing is flipped onto an outer perimeter edge.
+	if entry.Type == "Wall" then
+		for _, piece in self:GetHitboxPieces(grid, name, x, z, floor, rotation) do
+			if not piece.InBounds then
+				return false, "out of bounds"
+			end
+		end
+	else
+		for _, coord in computeCellCoords(entry, x, z, rotation) do
+			if not grid:IsInBounds(coord[1], coord[2]) then
+				return false, "out of bounds"
+			end
 		end
 	end
 	-- Hangers attach to the underside of every ceiling tile covered by their footprint.

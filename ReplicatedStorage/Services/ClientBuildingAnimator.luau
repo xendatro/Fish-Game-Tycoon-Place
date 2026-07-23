@@ -2,28 +2,32 @@
 ClientBuildingAnimator - the "juice" layer for building. It has no authority and touches
 no data; it only makes placements *feel* good on the local client.
 
-Two jobs:
+Three jobs:
   1. Watches the local player's plot for newly-rendered placements (which arrive via normal
      Roblox replication once the server commits them) and pops each one in - a scale
      overshoot, a short drop, a dust puff, and a brief confirm flash.
-  2. Exposes PoofModel/CloneForPoof/PoofClone so the delete tool can shrink an object out
+  2. FloorStamp: the delete/paint tools call it to stamp painted floor cells in with an
+     expanding splash + dust (floors greedy-remesh in bulk, so we can't animate the tiles
+     themselves without the whole level churning - a decoupled effect reads far better).
+  3. Exposes PoofModel/CloneForPoof/PoofClone so the delete tool can shrink an object out
      with a matching dust burst instead of having it blink out of existence.
 
 Everything here is presentation-only and local: only you see your own pop-ins and poofs,
 which is exactly what a build system wants (instant, personal feedback on your own action).
 
-Distinguishing an interactive placement from a bulk load matters - you don't want your
-entire saved base popping in when you join. We can't ask the server "was this a click?",
-so we infer it: a plot that replicates in already populated is a load (skip + a straggler
-grace window), and any single frame that adds more than BATCH_MAX children at once is a
-bulk op (undo of a huge drag, a paint sweep) rather than a hand placement. Small drags fall
-under the threshold and get a satisfying staggered cascade.
+Telling an interactive placement from a bulk load is done authoritatively, not guessed: the
+server stamps a `BulkRendered` attribute on anything it renders as part of loading or
+resetting a base, and we simply never animate those. Everything else - a click, a drag of
+any length, an undo - animates. To hide an object during its pre-pop wait we move it out of
+the rendered world entirely (into a Lighting staging folder) rather than just shrinking it,
+so it's genuinely invisible and stays intact even while its parts are still streaming in.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 local Debris = game:GetService("Debris")
 local TweenService = game:GetService("TweenService")
 
@@ -33,19 +37,36 @@ if not RunService:IsClient() then
 	return ClientBuildingAnimator
 end
 
+local Building = require(ReplicatedStorage.Config.Building)
+local Materials = require(ReplicatedStorage.Config.Materials)
+local SharedColorService = require(ReplicatedStorage.Services.SharedColorService)
+
 local player = Players.LocalPlayer
 
+-- Server attribute marking a render that was part of a bulk load/reset, not a hand action.
+local BULK_ATTRIBUTE = "BulkRendered"
+
 -- Tuning. All timings are in seconds, all distances in studs.
-local POP_DURATION = 0.26 -- pop-in length
-local POP_START_SCALE = 0.06 -- models grow from ~nothing so there's no full-size flash
+local POP_DURATION = Building.CEILING_ANIMATION_DURATION -- pop-in length
+local POP_START_SCALE = 0.04 -- scale the pop grows from (kept out of view while staged anyway)
 local POP_DROP_HEIGHT = 1.6 -- how far above its rest the object starts before slamming down
-local POP_STAGGER = 0.035 -- per-item delay so a drag cascades instead of popping as one blob
-local POP_BATCH_MAX = 24 -- a single frame adding more than this is a bulk load, not a placement
-local POP_BULK_GRACE = 2.5 -- ignore stragglers this long after a pre-populated plot binds
-local POP_CONCURRENT_CAP = 16 -- above this many live animations, new placements just snap in
+local POP_STAGGER = Building.CEILING_ANIMATION_STAGGER -- per-item drag cascade delay
+local POP_CONCURRENT_CAP = 40 -- above this many *live* animations, extra placements just snap in
+
+-- Ceilings and floor tiles compress their cascade as more are placed in one batch, so a big
+-- fill wraps up fast instead of dragging on. Walls/content ignore this (fixed cadence).
+local CASCADE_REF = Building.ANIMATION_CASCADE_REF -- batches up to this size play at full speed
+local CASCADE_MAX_SPEEDUP = Building.ANIMATION_CASCADE_MAX_SPEEDUP -- maximum large-batch speedup
 
 local POOF_DURATION = 0.22 -- delete shrink-out length
 local POOF_RISE = 0.9 -- slight upward drift as an object poofs
+
+local STAMP_DURATION = 0.26 -- floor-tile drop-in length
+local STAMP_DROP_HEIGHT = 1.2 -- how far above the surface a floor tile starts
+local STAMP_STAGGER = 0.03 -- per-cell delay so a paint drag sweeps
+local STAMP_THICKNESS = Building.FLOOR_THICKNESS
+local STAMP_RENDER_OFFSET = 0.003 -- keeps covers above the real surface without looking raised
+local STAMP_MAX = 200 -- paint requests beyond this skip the effect (bulk fill)
 
 local DUST_TEXTURE = "rbxasset://textures/particles/smoke_main.dds"
 local DUST_COLOR = Color3.fromRGB(236, 231, 220)
@@ -58,6 +79,12 @@ local activeCount = 0
 local effectsFolder = Instance.new("Folder")
 effectsFolder.Name = "BuildingEffects"
 effectsFolder.Parent = Workspace
+
+-- Non-rendered staging area. Objects wait here (invisible, but still in the DataModel so
+-- their parts finish streaming) between replicating in and their pop starting.
+local stagingFolder = Instance.new("Folder")
+stagingFolder.Name = "BuildingStaging"
+stagingFolder.Parent = Lighting
 
 -- ===== Easing ===============================================================
 -- Standard penner curves. Back over/undershoots for anticipation; cubic decelerates.
@@ -75,6 +102,12 @@ local function cubicOut(t: number): number
 end
 local function quadOut(t: number): number
 	return 1 - (1 - t) * (1 - t)
+end
+
+--[[How much to speed up a ceiling/floor cascade of `count` items: 1x for small batches,
+scaling up to CASCADE_MAX_SPEEDUP for large ones so a big fill finishes quickly.]]
+local function cascadeFactor(count: number): number
+	return math.clamp(count / CASCADE_REF, 1, CASCADE_MAX_SPEEDUP)
 end
 
 -- ===== Effects ==============================================================
@@ -142,121 +175,281 @@ local function spawnFlash(model: Model)
 	tween:Play()
 end
 
+--[[An expanding white "splash" square accent - the impact flash when a floor tile lands.]]
+local function spawnSplash(position: Vector3, cellSize: number)
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	part.Color = FLASH_COLOR
+	part.Transparency = 0.4
+	part.Size = Vector3.new(cellSize * 0.3, 0.05, cellSize * 0.3)
+	part.CFrame = CFrame.new(position + Vector3.new(0, 0.1, 0))
+	part.Parent = effectsFolder
+
+	local tween = TweenService:Create(
+		part,
+		TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Size = Vector3.new(cellSize * 1.05, 0.05, cellSize * 1.05), Transparency = 1 }
+	)
+	tween.Completed:Connect(function()
+		part:Destroy()
+	end)
+	tween:Play()
+end
+
+type FloorStamp = {
+	Position: Vector3,
+	PreviousMaterial: Enum.Material,
+	PreviousColor: Color3,
+}
+
+local function makeFloorTile(
+	position: Vector3,
+	cellSize: number,
+	material: Enum.Material,
+	color: Color3
+): (Part, CFrame)
+	local tile = Instance.new("Part")
+	tile.Anchored = true
+	tile.CanCollide = false
+	tile.CanQuery = false
+	tile.CanTouch = false
+	tile.CastShadow = false
+	tile.Material = material
+	tile.Color = color
+	tile.Size = Vector3.new(cellSize, STAMP_THICKNESS, cellSize)
+	local restCF = CFrame.new(position + Vector3.new(0, STAMP_RENDER_OFFSET, 0))
+	return tile, restCF
+end
+
+--[[Drops a tile matched to the new floor while an old-look cover hides the server remesh.
+The cover disappears only when the falling tile lands, so the new floor never flashes in
+under the animation.]]
+local function spawnFloorTile(
+	stamp: FloorStamp,
+	cellSize: number,
+	material: Enum.Material,
+	color: Color3,
+	duration: number,
+	cover: Part
+)
+	local tile, restCF = makeFloorTile(stamp.Position, cellSize, material, color)
+	tile.CFrame = restCF * CFrame.new(0, STAMP_DROP_HEIGHT, 0)
+	tile.Parent = effectsFolder
+
+	task.spawn(function()
+		local started = os.clock()
+		while tile.Parent do
+			RunService.Heartbeat:Wait()
+			local t = (os.clock() - started) / duration
+			if t >= 1 then
+				break
+			end
+			tile.CFrame = restCF * CFrame.new(0, STAMP_DROP_HEIGHT * (1 - cubicOut(t)), 0)
+		end
+		tile.CFrame = restCF
+		cover:Destroy()
+		spawnDust(stamp.Position, 5)
+		spawnSplash(stamp.Position, cellSize)
+		task.wait(0.1) -- hold so the real tile is certainly present beneath before we hand off
+		local fadeStart = os.clock()
+		while tile.Parent do
+			RunService.Heartbeat:Wait()
+			local t = (os.clock() - fadeStart) / 0.12
+			if t >= 1 then
+				break
+			end
+			tile.Transparency = t
+		end
+		tile:Destroy()
+	end)
+end
+
 -- ===== Pop-in ===============================================================
 
--- A child captured the instant it was added. A Model's rest pivot is read straight away
--- (WorldPivot replicates before its parts stream in, so it's reliable even on an "empty"
--- model), and we shrink it to the pop's start scale right away too - both as a best-effort
--- hide the frame it appears, and so it stays tiny (near-invisible) through any stagger wait
--- rather than sitting full-size. A slab is a lone Part that arrives whole, so it's moved up
--- and made transparent. The scale/pivot edits are local only; the server never fights them.
+-- A child captured the instant it was added, together with the container to return it to.
+-- A Model's rest pivot reads reliably straight away (WorldPivot replicates before its parts
+-- stream in); a slab is a lone Part with a CFrame. While it waits for its turn we park it in
+-- a non-rendered staging folder, so it's genuinely invisible - never a small-but-visible
+-- speck - and stays intact even mid-stream. All edits are local; the server never fights us.
 type Pending = {
 	inst: Instance,
+	container: Instance,
 	target: CFrame?,
 	targetCF: CFrame?,
 	transparency: number?,
 }
 
-local function hideModel(model: Model, target: CFrame)
-	pcall(function()
-		model:ScaleTo(POP_START_SCALE)
-		model:PivotTo(target * CFrame.new(0, POP_DROP_HEIGHT, 0))
-	end)
-end
-
---[[Captures a new child's resting transform and immediately hides it, so it doesn't linger
-at full size before its pop. Runs synchronously in ChildAdded, the same frame it appears.]]
-local function prehide(inst: Instance): Pending
-	local info: Pending = { inst = inst }
+--[[Captures a new child's resting transform and moves it out of the rendered world into the
+staging folder. Runs synchronously in ChildAdded, the same frame it first appears.]]
+local function stage(inst: Instance, container: Instance): Pending
+	local info: Pending = { inst = inst, container = container }
 	if inst:IsA("Model") then
 		info.target = inst:GetPivot()
-		hideModel(inst, info.target)
 	elseif inst:IsA("BasePart") then
 		info.targetCF = inst.CFrame
 		info.transparency = inst.Transparency
-		inst.CFrame = (info.targetCF :: CFrame) * CFrame.new(0, POP_DROP_HEIGHT, 0)
-		inst.Transparency = 1
 	end
+	inst.Parent = stagingFolder
 	return info
 end
 
---[[Snaps a prehidden child back to its resting state with no animation. Used when a batch
-turns out to be a bulk load, or when we're over the concurrency cap.]]
-local function restore(info: Pending)
+--[[Returns a staged child to its container at its final resting state, no animation. Used
+when we're over the concurrency cap.]]
+local function revealAtRest(info: Pending)
 	local inst = info.inst
-	if not inst.Parent then
-		return
-	end
 	if inst:IsA("Model") and info.target then
 		pcall(function()
-			inst:ScaleTo(1)
 			inst:PivotTo(info.target :: CFrame)
 		end)
 	elseif inst:IsA("BasePart") and info.targetCF then
 		inst.CFrame = info.targetCF
 		inst.Transparency = info.transparency or 0
 	end
+	inst.Parent = info.container
 end
 
---[[Pops a content/wall Model in: from its tiny+high start it drops and scales up past full
-size (Back overshoot) before settling exactly onto the server's transform. Dust and a flash
-fire on landing. Scale/pivot edits are purely local, so the instance is never fought over.]]
-local function popInModel(info: Pending, delay: number)
+--[[Pops a local display clone while the streamed server model stays staged and unscaled.
+At the end the clone hands off to the untouched server model. This prevents late-streamed
+parts from inheriting a changed scale and turning giant.]]
+local function popInModel(info: Pending, delay: number, duration: number)
 	local model = info.inst :: Model
 	local target = info.target :: CFrame
+	local container = info.container
 
-	-- Re-assert the hidden state synchronously: parts may have streamed in (at full size)
-	-- between the add and now, and staggered items must stay tiny through their wait.
-	hideModel(model, target)
-
-	activeCount += 1
 	task.spawn(function()
 		if delay > 0 then
 			task.wait(delay)
 		end
-		local started = os.clock()
-		while model.Parent do
+		if model.Parent ~= stagingFolder then
+			return -- removed (or reset) while it waited
+		end
+		-- Wait for the bounding box to settle so the display clone looks complete. The
+		-- authoritative model stays untouched even if more descendants stream in later.
+		local prevSize: Vector3? = nil
+		local stableFrames = 0
+		local deadline = os.clock() + 0.5
+		while model.Parent == stagingFolder do
+			local _, size = model:GetBoundingBox()
+			if prevSize and size.Magnitude > 1e-2 and (size - prevSize).Magnitude < 1e-3 then
+				stableFrames += 1
+				if stableFrames >= 2 then
+					break
+				end
+			else
+				stableFrames = 0
+			end
+			prevSize = size
+			if os.clock() > deadline then
+				break
+			end
 			RunService.Heartbeat:Wait()
-			local t = (os.clock() - started) / POP_DURATION
+		end
+		if model.Parent ~= stagingFolder then
+			return
+		end
+		if activeCount >= POP_CONCURRENT_CAP then
+			revealAtRest(info)
+			return
+		end
+		local ok, display = pcall(function()
+			return model:Clone()
+		end)
+		if not ok or not display then
+			revealAtRest(info)
+			return
+		end
+		activeCount += 1
+		pcall(function()
+			display:ScaleTo(POP_START_SCALE)
+			display:PivotTo(target * CFrame.new(0, POP_DROP_HEIGHT, 0))
+		end)
+		display.Parent = effectsFolder
+
+		local started = os.clock()
+		while display.Parent and model.Parent == stagingFolder do
+			RunService.Heartbeat:Wait()
+			local t = (os.clock() - started) / duration
 			if t >= 1 then
 				break
 			end
 			local scale = POP_START_SCALE + (1 - POP_START_SCALE) * backOut(t)
 			local drop = POP_DROP_HEIGHT * (1 - cubicOut(t))
 			pcall(function()
-				model:ScaleTo(scale)
-				model:PivotTo(target * CFrame.new(0, drop, 0))
+				display:ScaleTo(scale)
+				display:PivotTo(target * CFrame.new(0, drop, 0))
 			end)
 		end
-		if model.Parent then
-			pcall(function()
-				model:ScaleTo(1)
-				model:PivotTo(target)
-			end)
+		if model.Parent == stagingFolder and container.Parent then
+			revealAtRest(info)
 			local _, size = model:GetBoundingBox()
 			spawnDust(Vector3.new(target.X, target.Y - size.Y / 2, target.Z), 10)
 			spawnFlash(model)
 		end
+		display:Destroy()
 		activeCount -= 1
 	end)
 end
 
---[[Drops a ceiling/floor-style slab (a single Part, not a Model) in from above with a soft
-fade. Slabs are thin, so a scale pop reads badly; a drop + materialise looks right.]]
-local function popInPart(info: Pending, delay: number)
+local function ceilingFloorTile(part: BasePart, targetCF: CFrame): (Part?, CFrame?)
+	local materialIndex = part:GetAttribute("MaterialIndex")
+	if typeof(materialIndex) ~= "number" then
+		return nil, nil
+	end
+	local floorIndex = Materials.Ceiling[materialIndex].FloorMaterial
+	local topY = targetCF.Position.Y + part.Size.Y / 2
+	local position = Vector3.new(
+		targetCF.Position.X,
+		topY + Building.FLOOR_SURFACE_OFFSET - Building.FLOOR_THICKNESS / 2,
+		targetCF.Position.Z
+	)
+	local tile, restCF = makeFloorTile(
+		position,
+		Building.CELL_SIZE,
+		(Enum.Material :: any)[Materials.Floor[floorIndex].Material],
+		SharedColorService:MaterialColor("Floor", floorIndex, part:GetAttribute("TintColor"))
+	)
+	return tile, restCF
+end
+
+--[[Drops a ceiling slab and its matching upper floor tile as one piece. The temporary
+floor face stays until the server publishes the remeshed floor, then fades away.]]
+local function popInPart(info: Pending, delay: number, duration: number, hold: number)
 	local part = info.inst :: BasePart
 	local targetCF = info.targetCF :: CFrame
 	local targetTransparency = info.transparency or 0
+	local container = info.container
 
-	activeCount += 1
 	task.spawn(function()
 		if delay > 0 then
 			task.wait(delay)
 		end
+		if part.Parent ~= stagingFolder then
+			return
+		end
+		if activeCount >= POP_CONCURRENT_CAP then
+			revealAtRest(info)
+			return
+		end
+		activeCount += 1
+		local floorTile, floorTarget = ceilingFloorTile(part, targetCF)
+		part.CFrame = targetCF * CFrame.new(0, POP_DROP_HEIGHT, 0)
+		part.Transparency = 1
+		part.Parent = container
+		if floorTile and floorTarget then
+			floorTile.CFrame = floorTarget * CFrame.new(0, POP_DROP_HEIGHT, 0)
+			floorTile.Transparency = 1
+			floorTile.Parent = effectsFolder
+		end
+
 		local started = os.clock()
-		while part.Parent do
+		while part.Parent == container do
 			RunService.Heartbeat:Wait()
-			local t = (os.clock() - started) / POP_DURATION
+			local t = (os.clock() - started) / duration
 			if t >= 1 then
 				break
 			end
@@ -264,66 +457,89 @@ local function popInPart(info: Pending, delay: number)
 			pcall(function()
 				part.CFrame = targetCF * CFrame.new(0, drop, 0)
 				part.Transparency = targetTransparency + (1 - targetTransparency) * (1 - t)
+				if floorTile and floorTarget then
+					floorTile.CFrame = floorTarget * CFrame.new(0, drop, 0)
+					floorTile.Transparency = 1 - t
+				end
 			end)
 		end
-		if part.Parent then
+		if part.Parent == container then
 			pcall(function()
 				part.CFrame = targetCF
 				part.Transparency = targetTransparency
 			end)
+			if floorTile and floorTarget then
+				floorTile.CFrame = floorTarget
+				floorTile.Transparency = 0
+			end
 			spawnDust(part.Position - Vector3.new(0, part.Size.Y / 2, 0), 6)
+		elseif floorTile then
+			floorTile:Destroy()
 		end
 		activeCount -= 1
+		if floorTile and floorTile.Parent then
+			task.wait(hold)
+			local fade = TweenService:Create(floorTile, TweenInfo.new(0.12), { Transparency = 1 })
+			fade.Completed:Connect(function()
+				floorTile:Destroy()
+			end)
+			fade:Play()
+		end
 	end)
 end
 
-local function popIn(info: Pending, delay: number)
-	if activeCount >= POP_CONCURRENT_CAP then
-		restore(info) -- too much at once; reveal it instantly rather than drop frames
-		return
-	end
+local function popIn(info: Pending, delay: number, duration: number, hold: number)
 	local inst = info.inst
 	if inst:IsA("Model") and info.target then
-		popInModel(info, delay)
+		popInModel(info, delay, duration)
 	elseif inst:IsA("BasePart") and info.targetCF then
-		popInPart(info, delay)
+		popInPart(info, delay, duration, hold)
 	else
-		restore(info)
+		revealAtRest(info)
 	end
 end
 
 -- ===== Container watching ===================================================
--- Each rendered container (Built, Ceilings) gets one binding that coalesces the children
--- added in a frame into a batch, then decides: bulk load (restore) or hand placement (pop).
+-- Each rendered container (Built, Ceilings) gets one binding. New non-bulk children are
+-- staged out of view immediately, then popped in on the next frame (batched so a drag's
+-- children coalesce into one staggered cascade). Bulk children (server-marked loads/resets)
+-- are left untouched - that's the whole load-vs-placement decision, made authoritatively.
+-- `speedUp` containers (ceilings) compress their cascade as the batch grows; walls/content do not.
 
-type Binding = { conn: RBXScriptConnection, pending: { Pending }, flushing: boolean, bulkUntil: number }
+type Binding = {
+	conn: RBXScriptConnection,
+	pending: { Pending },
+	flushing: boolean,
+	seen: { [Instance]: boolean },
+	speedUp: boolean,
+}
 local bindings: { [Instance]: Binding } = {}
 
 local function flush(container: Instance, binding: Binding)
 	local batch = binding.pending
 	binding.pending = {}
 	binding.flushing = false
-	if #batch == 0 then
-		return
-	end
-	-- A whole base loading in, or a huge undo/paint sweep: no cascade, just reveal them.
-	if #batch > POP_BATCH_MAX or os.clock() < binding.bulkUntil then
-		for _, info in batch do
-			restore(info)
-		end
-		return
-	end
-	local index = 0
+
+	-- Filter to what's still staged, so the cascade compresses over the real count.
+	local live = {}
 	for _, info in batch do
-		if info.inst.Parent ~= container then
-			continue -- already removed before we could animate it
+		if info.inst.Parent == stagingFolder then
+			table.insert(live, info)
 		end
-		popIn(info, index * POP_STAGGER)
-		index += 1
+	end
+
+	local factor = if binding.speedUp then cascadeFactor(#live) else 1
+	local stagger = POP_STAGGER / factor
+	local duration = POP_DURATION / factor
+	local totalDuration = duration + math.max(0, #live - 1) * stagger
+	for index, info in live do
+		local delay = (index - 1) * stagger
+		local hold = totalDuration - delay - duration + Building.ANIMATION_HANDOFF_DELAY
+		popIn(info, delay, duration, hold)
 	end
 end
 
-local function bindContainer(container: Instance)
+local function bindContainer(container: Instance, speedUp: boolean)
 	if bindings[container] then
 		return
 	end
@@ -331,13 +547,19 @@ local function bindContainer(container: Instance)
 		conn = nil :: any,
 		pending = {},
 		flushing = false,
-		-- Present-at-bind children mean the plot arrived already built: treat it as a load
-		-- and swallow anything still streaming in for a moment after.
-		bulkUntil = if #container:GetChildren() > 0 then os.clock() + POP_BULK_GRACE else 0,
+		seen = setmetatable({}, { __mode = "k" }) :: any,
+		speedUp = speedUp,
 	}
-	binding.conn = container.ChildAdded:Connect(function(child)
-		-- Hide it right now, this frame, so it never flashes at full size.
-		table.insert(binding.pending, prehide(child))
+
+	local function consider(child: Instance)
+		if binding.seen[child] then
+			return
+		end
+		binding.seen[child] = true
+		if child:GetAttribute(BULK_ATTRIBUTE) then
+			return -- server rendered this as part of a load/reset; leave it be
+		end
+		table.insert(binding.pending, stage(child, container))
 		if binding.flushing then
 			return
 		end
@@ -347,8 +569,15 @@ local function bindContainer(container: Instance)
 			RunService.Heartbeat:Wait()
 			flush(container, binding)
 		end)
-	end)
+	end
+
+	binding.conn = container.ChildAdded:Connect(consider)
 	bindings[container] = binding
+	-- A first placement can land in the container before we connect (bind race); animate any
+	-- non-bulk children already present. A normal load's children are all bulk-marked.
+	for _, child in container:GetChildren() do
+		consider(child)
+	end
 end
 
 local function unbindContainer(container: Instance)
@@ -367,8 +596,11 @@ end
 local plotConns: { [Instance]: { RBXScriptConnection } } = {}
 
 local function maybeBindContainer(child: Instance)
-	if child.Name == "Built" or child.Name == "Ceilings" then
-		bindContainer(child)
+	-- Ceilings speed up their cascade as more are placed; Built (walls/content) keeps a fixed cadence.
+	if child.Name == "Built" then
+		bindContainer(child, false)
+	elseif child.Name == "Ceilings" then
+		bindContainer(child, true)
 	end
 end
 
@@ -496,6 +728,37 @@ function ClientBuildingAnimator:PoofModel(model: Model): boolean
 	end
 	self:PoofClone(clone)
 	return true
+end
+
+-- ===== Floor stamps (driven by the paint tool) ==============================
+
+--[[Drops a matched tile into each painted cell while a cell-sized copy of its old surface
+covers the immediate server remesh. A huge fill skips the effect.]]
+function ClientBuildingAnimator:FloorStamp(
+	stamps: { FloorStamp },
+	cellSize: number,
+	material: Enum.Material,
+	color: Color3
+)
+	if #stamps == 0 or #stamps > STAMP_MAX then
+		return
+	end
+	local factor = cascadeFactor(#stamps)
+	local stagger = STAMP_STAGGER / factor
+	local duration = STAMP_DURATION / factor
+	for index, stamp in stamps do
+		local cover, restCF = makeFloorTile(
+			stamp.Position,
+			cellSize,
+			stamp.PreviousMaterial,
+			stamp.PreviousColor
+		)
+		cover.CFrame = restCF
+		cover.Parent = effectsFolder
+		task.delay((index - 1) * stagger, function()
+			spawnFloorTile(stamp, cellSize, material, color, duration, cover)
+		end)
+	end
 end
 
 return ClientBuildingAnimator

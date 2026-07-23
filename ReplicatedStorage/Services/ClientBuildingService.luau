@@ -591,19 +591,33 @@ local function cellUnderCursor(grid: Grid.Grid, floor: number?, ceiling: boolean
 	return math.clamp(x, 0, grid.Width - 1), math.clamp(z, 0, grid.Depth - 1), position
 end
 
---[[For walls, rotation chooses the horizontal/vertical axis while the cursor chooses
-the nearest edge on that axis. Other assets keep their explicit four-way rotation.]]
+--[[Placement rotation is entirely manual (the R key) for every asset, walls included, so a
+wall never flips on its own. R cycles a wall through axis -> next axis -> same axis flipped
+(rotation 0..3); each rotation is a fixed facing/axis, not chosen from the cursor.]]
 local function resolvePlacementRotation(grid: Grid.Grid, name: string, x: number, z: number, hitPosition: Vector3): number
+	return currentRotation
+end
+
+--[[Position still snaps to the nearest edge (not the tile): for a wall at its manual
+rotation, offset the target cell so the wall lands on the grid edge LINE closest to the
+cursor. rotation 0 sits on the cell's own -Z line, rotation 2 on its +Z line (and 3/1 for
+-X/+X), so we shift the cell to put the manual rotation's edge on the nearest line. Non-walls
+are returned unchanged.]]
+local function snapWallCell(grid: Grid.Grid, name: string, x: number, z: number, hitPosition: Vector3, rotation: number): (number, number)
 	local entry = SharedBuildingService:GetEntry(name)
 	if not entry or entry.Type ~= "Wall" then
-		return currentRotation
+		return x, z
 	end
-
-	local centre = grid:GetCellCenter(x, z)
-	if currentRotation % 2 == 0 then
-		return if hitPosition.Z < centre.Z then 0 else 2 -- south / north
+	local cell = Building.CELL_SIZE
+	if rotation % 2 == 0 then
+		local line = math.round((hitPosition.Z - grid.Origin.Z) / cell)
+		local newZ = if rotation == 0 then line else line - 1
+		return x, newZ
+	else
+		local line = math.round((hitPosition.X - grid.Origin.X) / cell)
+		local newX = if rotation == 3 then line else line - 1
+		return newX, z
 	end
-	return if hitPosition.X < centre.X then 3 else 1 -- west / east
 end
 
 local function refreshStatus(extra: string?)
@@ -632,9 +646,10 @@ local function refreshStatus(extra: string?)
 	if CameraModeButton then
 		CameraModeButton.Text = if freeCameraMode then "Camera: Free" else "Camera: Character"
 	end
+	local wallEdges = { [0] = "wall S", [1] = "wall E", [2] = "wall N", [3] = "wall W" }
 	local entry = selectedAsset and SharedBuildingService:GetEntry(selectedAsset)
 	local rotationText = if entry and entry.Type == "Wall"
-		then (if currentRotation % 2 == 0 then "wall horizontal" else "wall vertical")
+		then wallEdges[currentRotation]
 		else `rot {currentRotation * 90}°`
 	statusLabel.Text = `{mode} | level {currentFloor} | {if freeCameraMode then "free cam" else "character cam"} | {rotationText}{if extra then " | " .. extra else ""}`
 end
@@ -645,8 +660,8 @@ local function requestHistory(action: "undo" | "redo")
 end
 
 local function rotateSelection()
-	local entry = selectedAsset and SharedBuildingService:GetEntry(selectedAsset)
-	currentRotation = if entry and entry.Type == "Wall" then (currentRotation + 1) % 2 else (currentRotation + 1) % 4
+	-- All assets, walls included, rotate through the same four manual orientations.
+	currentRotation = (currentRotation + 1) % 4
 	refreshStatus()
 end
 
@@ -660,6 +675,44 @@ local function rectangleCells(startX: number, startZ: number, endX: number, endZ
 		end
 	end
 	return cells
+end
+
+local floorPartAt: (Instance?, Grid.Grid, number, number, number) -> BasePart?
+
+--[[The material + colour a painted floor tile will render as, so the stamp overlay matches
+the real tile it hands off to. Mirrors what the server renders for that material/tint.]]
+local function floorTileAppearance(materialIndex: number, packedColor: number?): (Enum.Material, Color3)
+	local material = (Enum.Material :: any)[Materials.Floor[materialIndex].Material]
+	local color = SharedColorService:MaterialColor("Floor", materialIndex, packedColor)
+	return material, color
+end
+
+--[[Fires floor-paint stamps before the server request. Each stamp records the rendered
+surface it is replacing, so the animator can cover the server's remesh with the old look
+until the falling new tile lands.]]
+local function stampFloorPaint(grid: Grid.Grid, cells: { CellRequest }, floor: number, materialIndex: number)
+	local material, color = floorTileAppearance(materialIndex, surfaceColor("Floor"))
+	local base = getMyPlotBase()
+	local floorContainer = base and base.Parent:FindFirstChild("Floor")
+	local stamps = {}
+	for _, cell in cells do
+		local previous = floorPartAt(floorContainer, grid, cell.X, cell.Z, floor)
+		if SharedBuildingService:CanPaintFloor(grid, cell.X, cell.Z, floor)
+			and previous
+			and (previous.Material ~= material or previous.Color ~= color)
+		then
+			local centre = grid:GetCellCenter(cell.X, cell.Z)
+			table.insert(stamps, {
+				Position = Vector3.new(centre.X, previous.Position.Y, centre.Z),
+				PreviousMaterial = previous.Material,
+				PreviousColor = previous.Color,
+			})
+		end
+	end
+	if #stamps == 0 then
+		return
+	end
+	BuildingAnimator:FloorStamp(stamps, Building.CELL_SIZE, material, color)
 end
 
 local function dragPlacements(state: DragState, endX: number, endZ: number): { PlacementRequest }
@@ -784,7 +837,7 @@ local function deleteCells(state: DeleteDragState, endX: number, endZ: number): 
 end
 
 -- Rendered floor rectangles may cover many cells after greedy meshing.
-local function floorPartAt(container: Instance?, grid: Grid.Grid, x: number, z: number, floor: number): BasePart?
+floorPartAt = function(container: Instance?, grid: Grid.Grid, x: number, z: number, floor: number): BasePart?
 	if not container then
 		return nil
 	end
@@ -1200,7 +1253,8 @@ local function updatePreview(dt: number)
 			requests = dragPlacements(dragState, x, z)
 		else
 			local rotation = resolvePlacementRotation(grid, name, x, z, hitPosition)
-			requests = { { X = x, Z = z, Floor = targetFloor, Rotation = rotation } }
+			local snappedX, snappedZ = snapWallCell(grid, name, x, z, hitPosition, rotation)
+			requests = { { X = snappedX, Z = snappedZ, Floor = targetFloor, Rotation = rotation } }
 		end
 		for index, request in requests do
 			local model = getPlacementPreview(index, name)
@@ -1474,6 +1528,7 @@ local function onClick()
 	end
 
 	if paintMode then
+		stampFloorPaint(grid, { { X = x, Z = z } }, currentFloor, paintMaterial)
 		local ok, reason = ClientBuildingService:RequestPaint(x, z, currentFloor, paintMaterial)
 		refreshStatus(if ok then `painted ({x},{z})` else `rejected: {reason}`)
 	elseif ceilingMode then
@@ -1481,6 +1536,7 @@ local function onClick()
 		refreshStatus(if ok then `ceiling ({x},{z})` else `rejected: {reason}`)
 	else
 		local rotation = resolvePlacementRotation(grid, selectedAsset :: string, x, z, hitPosition :: Vector3)
+		x, z = snapWallCell(grid, selectedAsset :: string, x, z, hitPosition :: Vector3, rotation)
 		local ok, reason = ClientBuildingService:RequestPlace(selectedAsset :: string, x, z, currentFloor, rotation)
 		refreshStatus(if ok then `placed ({x},{z})` else `rejected: {reason}`)
 	end
@@ -1648,6 +1704,9 @@ local function beginDrag(): boolean
 	local rotation = if mode == "Item"
 		then resolvePlacementRotation(grid, selectedAsset :: string, x, z, hitPosition)
 		else currentRotation
+	if mode == "Item" then
+		x, z = snapWallCell(grid, selectedAsset :: string, x, z, hitPosition, rotation)
+	end
 	dragState = {
 		Mode = mode,
 		StartX = x,
@@ -1691,6 +1750,10 @@ local function finishDrag()
 		local requests = rectangleCells(state.StartX, state.StartZ, state.LastX, state.LastZ)
 		if state.Mode == "Paint" then
 			local color = surfaceColor("Floor")
+			local stampBase = getMyPlotBase()
+			if stampBase then
+				stampFloorPaint(buildMirrorGrid(stampBase), requests, state.Floor, state.Material)
+			end
 			local painted, reason = paintRemote:InvokeServer(requests, state.Floor, state.Material, color)
 			refreshStatus(if painted > 0 then `painted {painted}/{#requests}` else `rejected: {reason}`)
 		else
