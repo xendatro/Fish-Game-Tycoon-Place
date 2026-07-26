@@ -18,5 +18,11 @@ return {
 	TestWall = {
 		Type = "Wall",
 		Draggable = "Line",
+	},
+	
+	TestDoor = {
+		Type = "Wall",
+		Draggable = "Line",
+		CanWalkThrough = true,
 	}
 }

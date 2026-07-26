@@ -25,6 +25,15 @@ export type CatalogEntry = {
 	Type: ItemType,
 	-- Line follows the item's authored length; Area fills an X/Z footprint lattice.
 	Draggable: ("Line" | "Area")?,
+	-- Guest navigation (see SharedNpcService). These affect NPCs only - neither one
+	-- changes what a player may build where.
+	--   CanWalkThrough  a doorway: guests may pass, but only straight through it. They
+	--                   line up on the cell in front and step to the cell behind, and no
+	--                   diagonal may touch it. For doors and archways.
+	--   NpcNoCollision  guests ignore it entirely, at any angle. For things with nothing
+	--                   solid to walk into - low decor, rugs, open frames.
+	CanWalkThrough: boolean?,
+	NpcNoCollision: boolean?,
 	-- Footprint in whole cells, derived by measuring the model.
 	Footprint: { Width: number, Depth: number },
 	-- Per-slot UI labels ("Pot", "Trunk"), and this item's own colour presets keyed by ITS
