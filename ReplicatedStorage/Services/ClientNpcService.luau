@@ -160,11 +160,22 @@ local function paceAt(distance: number, total: number): number
 	return math.clamp(ramp, MIN_PACE, 1)
 end
 
---[[Unpacks {x1, z1, x2, z2, ...} into positions at one height.]]
-local function unflatten(flat: { number }, y: number): { Vector3 }
+--[[Unpacks a walked line's {x1, y1, z1, ...} triples. Height is per point: a leg with a
+stair in it climbs, and the segment either side of the climb is flat.]]
+local function unflattenLine(flat: { number }): { Vector3 }
+	local points = {}
+	for i = 1, #flat - 2, 3 do
+		table.insert(points, Vector3.new(flat[i], flat[i + 1], flat[i + 2]))
+	end
+	return points
+end
+
+--[[Unpacks standing places' {x1, z1, ...} pairs. A formation is always on one level and
+each guest stands at their own height, so these carry none.]]
+local function unflattenSpots(flat: { number }): { Vector3 }
 	local points = {}
 	for i = 1, #flat - 1, 2 do
-		table.insert(points, Vector3.new(flat[i], y, flat[i + 1]))
+		table.insert(points, Vector3.new(flat[i], 0, flat[i + 1]))
 	end
 	return points
 end
@@ -363,7 +374,7 @@ local function applyEvent(event: { [string]: any })
 	-- One leg shared by the whole squad; followers differ only by their slot.
 	local leg: Leg? = nil
 	if event.Kind == "Move" then
-		local points = unflatten(event.Points, event.Y)
+		local points = unflattenLine(event.Points)
 		local total = polylineLength(points)
 		leg = {
 			Points = points,
@@ -371,7 +382,7 @@ local function applyEvent(event: { [string]: any })
 			Speed = event.Speed,
 			Total = total,
 			Spread = event.Spread or Npc.Movement.MemberSpread,
-			Spots = event.Spots and unflatten(event.Spots, event.Y),
+			Spots = event.Spots and unflattenSpots(event.Spots),
 			FanOut = event.FanOut,
 			FanInDistance = math.min(Npc.Formation.FanIn, total / 2),
 			FanOutDistance = math.min(event.FanOut or 0, total / 2),
@@ -381,7 +392,7 @@ local function applyEvent(event: { [string]: any })
 	-- A squad that stopped without anything to look at turns inward on itself, so it reads
 	-- as a group talking rather than four people facing off in random directions. Worked
 	-- out for walks too, since a guest looks up the moment they arrive.
-	local spots = if event.Spots then unflatten(event.Spots, 0) else nil
+	local spots = if event.Spots then unflattenSpots(event.Spots) else nil
 	local huddle: Vector3? = nil
 	if spots and #spots > 1 and not event.FaceX then
 		local sum = Vector3.zero
@@ -514,9 +525,12 @@ local function updateGuest(guest: Guest, timestamp: number, delta: number)
 			local want = leg.Speed * delta * paceAt(guest.Distance, total)
 			local step = math.min(want, total - guest.Distance)
 			local ahead = positionFor(guest, leg, guest.Distance + step)
-			local ground = Vector3.new(ahead.X - guest.Position.X, 0, ahead.Z - guest.Position.Z).Magnitude
-			if ground > want and ground > 1e-4 then
-				step *= want / ground
+			-- Measured in three dimensions, so a stair's rise counts as ground covered and
+			-- both sides agree on when the climb ends. Every other leg is level, where this
+			-- is the same number it has always been.
+			local covered = (ahead - guest.Position).Magnitude
+			if covered > want and covered > 1e-4 then
+				step *= want / covered
 			end
 			guest.Distance = math.min(total, guest.Distance + step)
 		end

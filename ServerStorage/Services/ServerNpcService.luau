@@ -113,18 +113,21 @@ local function createSim(plot): Sim
 		sim.Crowd = nil
 	end
 	--[[Cells someone is stood in cost more to path through, so guests walk around a crowd
-	when there's room. Rebuilt lazily, since spots change far less often than paths ask.]]
-	sim.World.CrowdCost = function(x: number, z: number): number
+	when there's room. Keyed by level too, so a party upstairs doesn't push guests around
+	the empty floor below it. Rebuilt lazily, since spots change far less often than paths
+	ask.]]
+	sim.World.CrowdCost = function(x: number, z: number, floor: number): number
 		local crowd = sim.Crowd
 		if not crowd then
 			crowd = {}
 			for _, spot in sim.Spots do
 				local cellX, cellZ = sim.Grid:WorldToCell(spot)
-				crowd[`{cellX},{cellZ}`] = true
+				local level = SharedNpcService:FloorAtHeight(sim.Grid, spot.Y)
+				crowd[`{level}:{cellX},{cellZ}`] = true
 			end
 			sim.Crowd = crowd
 		end
-		return if crowd[`{x},{z}`] then Npc.Nav.CrowdPenalty else 1
+		return if crowd[`{floor}:{x},{z}`] then Npc.Nav.CrowdPenalty else 1
 	end
 	sim.World.SpotFree = function(position: Vector3, exclude: { [number]: boolean })
 		for id, spot in sim.Spots do
@@ -330,6 +333,11 @@ debugRemote.OnServerInvoke = function(player: Player, action: any, value: any)
 		ServerNpcService:SpawnGroup(sim)
 	elseif action == "Clear" then
 		ServerNpcService:ClearPlot(sim)
+	elseif action == "Stairs" then
+		-- Read straight off the authoritative grid, so this reports what the sim actually
+		-- routes on rather than anything the client reconstructed.
+		syncWorld(sim)
+		return { Stairs = if sim.Grid then SharedNpcService:InspectStairs(sim.Grid) else {} }
 	end
 
 	flush(sim)

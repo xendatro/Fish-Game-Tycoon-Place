@@ -26,6 +26,10 @@ local debugRemote = ReplicatedStorage:WaitForChild("Communication"):WaitForChild
 local REFRESH_INTERVAL = 0.25
 local SEND_INTERVAL = 0.15
 local PATH_COLOR = Color3.fromRGB(120, 220, 255)
+-- Stair routes ride the same overlay: green where guests can use the stair, red where the
+-- stair renders fine but yields no route at all (the failure that is otherwise silent).
+local STAIR_LIVE_COLOR = Color3.fromRGB(120, 255, 150)
+local STAIR_DEAD_COLOR = Color3.fromRGB(255, 110, 110)
 
 local Popularity = 50
 local PathsVisible = false
@@ -114,19 +118,47 @@ panel.Clear.Activated:Connect(function()
 	task.spawn(debugRemote.InvokeServer, debugRemote, "Clear")
 end)
 
-panel.Paths.Activated:Connect(function()
-	PathsVisible = not PathsVisible
-	panel.Paths.Text = `Paths: {if PathsVisible then "On" else "Off"}`
-	if not PathsVisible and PathFolder then
-		PathFolder:Destroy()
-		PathFolder = nil
-	end
-end)
-
 -- ===== Path overlay =========================================================
 
+--[[Draws one polyline as thin neon segments.]]
+local function drawLine(folder: Folder, points: { Vector3 }, color: Color3, thickness: number)
+	for i = 2, #points do
+		local from, to = points[i - 1], points[i]
+		local segment = to - from
+		if segment.Magnitude < 1e-3 then
+			continue
+		end
+		local part = Instance.new("Part")
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.Material = Enum.Material.Neon
+		part.Color = color
+		part.Transparency = 0.4
+		part.Size = Vector3.new(thickness, thickness, segment.Magnitude)
+		part.CFrame = CFrame.lookAt(from:Lerp(to, 0.5) + Vector3.new(0, 0.2, 0), to + Vector3.new(0, 0.2, 0))
+		part.Parent = folder
+	end
+end
+
+--[[
+Asks the server which flights of stairs guests can actually climb.
+
+A flight that yields no route is invisible otherwise - its stairs render correctly and are
+simply never walked - so the overlay draws every flight, green where it is usable and red
+where it is not. Fetched when the overlay is switched on rather than polled, so a plot with
+paths showing isn't making a remote call several times a second; toggle it to re-read after
+building.
+]]
+local StairReports: { any } = {}
+local function refreshStairs()
+	local state = debugRemote:InvokeServer("Stairs")
+	StairReports = state and state.Stairs or {}
+end
+
 --[[Redraws every walked polyline as a thin neon line, so pathing and floor weighting are
-visible at a glance.]]
+visible at a glance. Stair routes are drawn alongside them, live or dead.]]
 local function drawPaths()
 	if PathFolder then
 		PathFolder:Destroy()
@@ -136,27 +168,27 @@ local function drawPaths()
 	folder.Parent = Workspace
 	PathFolder = folder
 
+	for _, report in StairReports do
+		drawLine(folder, report.Points, if report.Live then STAIR_LIVE_COLOR else STAIR_DEAD_COLOR, 0.3)
+	end
 	for _, points in ClientNpcService:GetActiveLegs() do
-		for i = 2, #points do
-			local from, to = points[i - 1], points[i]
-			local segment = to - from
-			if segment.Magnitude < 1e-3 then
-				continue
-			end
-			local part = Instance.new("Part")
-			part.Anchored = true
-			part.CanCollide = false
-			part.CanQuery = false
-			part.CanTouch = false
-			part.Material = Enum.Material.Neon
-			part.Color = PATH_COLOR
-			part.Transparency = 0.4
-			part.Size = Vector3.new(0.15, 0.15, segment.Magnitude)
-			part.CFrame = CFrame.lookAt(from:Lerp(to, 0.5) + Vector3.new(0, 0.2, 0), to + Vector3.new(0, 0.2, 0))
-			part.Parent = folder
-		end
+		drawLine(folder, points, PATH_COLOR, 0.15)
 	end
 end
+
+panel.Paths.Activated:Connect(function()
+	PathsVisible = not PathsVisible
+	panel.Paths.Text = `Paths: {if PathsVisible then "On" else "Off"}`
+	if PathsVisible then
+		task.spawn(refreshStairs)
+	else
+		StairReports = {}
+		if PathFolder then
+			PathFolder:Destroy()
+			PathFolder = nil
+		end
+	end
+end)
 
 -- ===== Refresh loop =========================================================
 

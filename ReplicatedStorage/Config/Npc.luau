@@ -13,9 +13,9 @@ local Npc = {}
 -- so this only controls how quickly a squad picks its NEXT thing to do, not smoothness.
 Npc.TICK_RATE = 5
 
--- Guests live on the ground build level only. There are no stairs yet; when they exist,
--- pathing gains a floor-transition step and this becomes a starting floor instead.
-Npc.FLOOR = 1
+-- The build level the entrance sits on. Guests arrive and leave here; anywhere else in the
+-- plot is reached by pathing, stairs included (see SharedNpcService's stair portals).
+Npc.ENTRY_FLOOR = 1
 
 --[[
 Popularity is one 0-100 number per plot driving both arrival cadence and crowd size.
@@ -181,6 +181,10 @@ Npc.Nav = {
 	-- Walled-in guests idle and retry, then give up and fade out rather than piling up.
 	StuckRetry = 2,
 	StuckGiveUp = 20,
+	-- Multiplier on the ground a stair covers (its run plus the cell either end). Above 1 so
+	-- a guest with a choice keeps to the floor they're on, but low enough that anything
+	-- genuinely upstairs is still worth the climb.
+	StairCost = 1.2,
 }
 
 return Npc

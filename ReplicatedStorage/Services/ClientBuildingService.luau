@@ -1988,6 +1988,7 @@ local function buildDebugUI()
 
 	local assetPage = addPage("Assets")
 	local wallPage = addPage("Walls")
+	local stairPage = addPage("Stairs")
 	local ceilingPage = addPage("Ceilings")
 	local floorPage = addPage("Floors")
 	local colorPage = addPage("Colors")
@@ -2019,11 +2020,15 @@ local function buildDebugUI()
 	end
 	addAssets(assetPage, assetNames)
 	addAssets(wallPage, byType.Wall or {})
+	addAssets(stairPage, byType.Stair or {})
 	if #assetNames == 0 then
 		addNotice(assetPage, "No content assets configured")
 	end
 	if #(byType.Wall or {}) == 0 then
 		addNotice(wallPage, "No walls configured")
+	end
+	if #(byType.Stair or {}) == 0 then
+		addNotice(stairPage, "No stairs configured")
 	end
 
 	for index, material in Materials.Ceiling do

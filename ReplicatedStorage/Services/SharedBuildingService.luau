@@ -19,7 +19,7 @@ local Grid = require(ReplicatedStorage.Classes.Grid)
 
 local SharedBuildingService = {}
 
-export type ItemType = "Content" | "Wall" | "Ceiling" | "Hanger"
+export type ItemType = "Content" | "Wall" | "Ceiling" | "Hanger" | "Stair"
 export type CatalogEntry = {
 	Name: string,
 	Type: ItemType,
@@ -34,6 +34,10 @@ export type CatalogEntry = {
 	--                   solid to walk into - low decor, rugs, open frames.
 	CanWalkThrough: boolean?,
 	NpcNoCollision: boolean?,
+	-- Off the plot base, a placement normally needs a slab under it. Floating opts out:
+	-- the item may be placed on any level with nothing holding it up. Walls and hangers are
+	-- structural and never need support regardless of this flag.
+	Floating: boolean?,
 	-- Footprint in whole cells, derived by measuring the model.
 	Footprint: { Width: number, Depth: number },
 	-- Per-slot UI labels ("Pot", "Trunk"), and this item's own colour presets keyed by ITS
@@ -177,6 +181,29 @@ local function computeCellCoords(entry: CatalogEntry, x: number, z: number, rota
 		end
 	end
 	return coords
+end
+
+--[[
+Returns a stair's ascending direction as a unit cell step (dx, dz), plus its run in cells.
+
+The run is the LONGER of the footprint's two axes - a staircase is longer than it is wide -
+so a model may be authored climbing along either of its local axes and still resolve to the
+same thing. Which END of that axis is the bottom step is the model's business: the anchor
+cell is the low one, so a stair that comes out facing downhill is a 180-degree turn in
+Studio, not a config change.
+]]
+function SharedBuildingService:GetStairRun(name: string, rotation: number): (number, number, number)
+	local entry = catalog[name]
+	if not entry then
+		return 1, 0, 1
+	end
+	local width, depth = entry.Footprint.Width, entry.Footprint.Depth
+	if width >= depth then
+		local dx, dz = rotateOffset(1, 0, rotation)
+		return dx, dz, width
+	end
+	local dx, dz = rotateOffset(0, 1, rotation)
+	return dx, dz, depth
 end
 
 --[[Returns the cell keys a content/ceiling footprint occupies.]]
@@ -357,6 +384,15 @@ function SharedBuildingService:PivotModelToLevel(
 	model:PivotTo(model:GetPivot() + Vector3.new(0, targetY - modelEdgeY, 0))
 end
 
+--[[Returns whether a cell is left open by something that climbs through it - today, a
+stair, whose whole point is the hole it needs in the level above.]]
+local function isOpenToLevelAbove(grid: Grid.Grid, x: number, z: number, floor: number): boolean
+	local id = grid:GetCellOccupant(x, z, floor)
+	local placement = id and grid:GetPlacement(id)
+	local entry = placement and catalog[placement.Name]
+	return entry ~= nil and entry.Type == "Stair"
+end
+
 --[[Adds every available member of a floor-slab selection to the supplied grid. Slabs
 may float freely; the client calls this on its mirror and the server on the real grid.]]
 function SharedBuildingService:FillCeilings(
@@ -370,7 +406,12 @@ function SharedBuildingService:FillCeilings(
 	local topOffset = self:GetLevelTopOffset(floor)
 	for index, cell in cells do
 		local key = `{cell.X},{cell.Z}`
-		if not seen[key] and grid:IsInBounds(cell.X, cell.Z) and not grid:GetCeiling(cell.X, cell.Z, floor) then
+		if
+			not seen[key]
+			and grid:IsInBounds(cell.X, cell.Z)
+			and not grid:GetCeiling(cell.X, cell.Z, floor)
+			and not isOpenToLevelAbove(grid, cell.X, cell.Z, floor)
+		then
 			grid:SetCeiling(cell.X, cell.Z, floor, topOffset, material, color)
 			table.insert(placed, { Index = index, X = cell.X, Z = cell.Z, TopOffset = topOffset })
 		end
@@ -508,8 +549,25 @@ function SharedBuildingService:CanPlace(
 				return false, "needs ceiling above"
 			end
 		end
-	-- Structural pieces may float; ordinary content must rest on a slab below.
-	elseif floor > 1 and entry.Type ~= "Wall" and entry.Type ~= "Floor" then
+	-- A stair climbs THROUGH the level above it, so every cell it runs under has to be open
+	-- to the sky. The mirror rule (no ceiling over a stair) lives in FillCeilings.
+	elseif entry.Type == "Stair" then
+		for _, coord in computeCellCoords(entry, x, z, rotation) do
+			if grid:GetCeiling(coord[1], coord[2], floor) then
+				return false, "ceiling in the way above"
+			end
+		end
+	end
+
+	-- Structural pieces may float, and so may anything that opts in; everything else rests
+	-- on a slab once it is off the plot base.
+	if
+		floor > 1
+		and entry.Floating ~= true
+		and entry.Type ~= "Hanger"
+		and entry.Type ~= "Wall"
+		and entry.Type ~= "Floor"
+	then
 		for _, coord in computeCellCoords(entry, x, z, rotation) do
 			if not grid:GetCeiling(coord[1], coord[2], floor - 1) then
 				return false, "needs ceiling below"

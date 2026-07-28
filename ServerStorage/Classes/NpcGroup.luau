@@ -38,12 +38,18 @@ type Squad = {
 	State: "Move" | "Idle" | "Stuck",
 	Goal: Goal,
 	Points: { Vector3 }?,
+	-- The build level each point of the current leg sits on, and which of its segments are
+	-- inside a staircase. See SharedNpcService.Route - `Climbing` is not the same question
+	-- as "these two points differ in level", which is why it is carried rather than derived.
+	Floors: { number }?,
+	Climbing: { boolean }?,
+	Floor: number, -- the level the squad is on RIGHT NOW, advanced as it walks
 	Spread: number?,
 	Spots: { Vector3 }?, -- where each member stands while stopped
 	StartTime: number,
 	EndTime: number,
 	Position: Vector3,
-	Target: SharedNpcService.Cell?,
+	Target: SharedNpcService.Node?,
 	Face: Vector3?,
 	StuckSince: number?,
 	RetryAt: number?,
@@ -95,6 +101,20 @@ local function polylineLength(points: { Vector3 }): number
 	return total
 end
 
+--[[Returns the index of the segment `distance` along a polyline falls in (1-based on the
+segment's FIRST point), clamped to the polyline's ends.]]
+local function segmentAt(points: { Vector3 }, distance: number): number
+	local travelled = 0
+	for i = 2, #points do
+		local segment = (points[i] - points[i - 1]).Magnitude
+		if travelled + segment >= distance then
+			return i - 1
+		end
+		travelled += segment
+	end
+	return math.max(1, #points - 1)
+end
+
 --[[Returns the position `distance` along a polyline (clamped at both ends).]]
 local function sampleAt(points: { Vector3 }, distance: number): Vector3
 	if distance <= 0 then
@@ -119,15 +139,45 @@ local function idsOf(squad: Squad): { number }
 	return ids
 end
 
---[[Flattens a polyline to the {x1, z1, x2, z2, ...} pairs sent over the wire. Y is
-constant for a leg (guests stay on one build level), so it travels separately.]]
-local function flatten(points: { Vector3 }): { number }
+--[[Flattens a walked polyline to the {x1, y1, z1, x2, y2, z2, ...} triples sent over the
+wire. Height travels per point rather than per leg: a leg with a stair in it climbs.]]
+local function flattenLine(points: { Vector3 }): { number }
+	local flat = {}
+	for _, point in points do
+		table.insert(flat, point.X)
+		table.insert(flat, point.Y)
+		table.insert(flat, point.Z)
+	end
+	return flat
+end
+
+--[[Flattens standing places to {x1, z1, ...} pairs. A formation is always on one level and
+the client stands guests at their own height, so these carry no Y.]]
+local function flattenSpots(points: { Vector3 }): { number }
 	local flat = {}
 	for _, point in points do
 		table.insert(flat, point.X)
 		table.insert(flat, point.Z)
 	end
 	return flat
+end
+
+--[[The direction a leg sets off in, flattened: followers step to the side of the line, and
+sideways means sideways on the floorplan even where the line is climbing.]]
+local function groundDirection(from: Vector3, to: Vector3): Vector3?
+	local delta = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+	return if delta.Magnitude > 1e-3 then delta.Unit else nil
+end
+
+--[[Wraps a plain polyline as a route on one level, for the off-grid approach lanes. They
+run outside the plot to the doorway, so they cross no stairs and never change level.]]
+local function flatRoute(points: { Vector3 }, floor: number): SharedNpcService.Route
+	local floors, climbing = {}, {}
+	for index = 1, #points do
+		floors[index] = floor
+		climbing[index] = false
+	end
+	return { Points = points, Floors = floors, Climbing = climbing }
 end
 
 --[[
@@ -209,6 +259,7 @@ function NpcGroup.new(id: number, members: { Member }, world: World)
 			Members = members,
 			State = "Idle",
 			Goal = "Enter",
+			Floor = world.Entrance.Cell.Floor,
 			StartTime = 0,
 			EndTime = 0,
 			Position = world.Entrance.Outside,
@@ -243,9 +294,9 @@ function NpcGroup:Spawn(now: number)
 		self._world.Grid,
 		entrance.Cell.X,
 		entrance.Cell.Z,
-		Npc.FLOOR
+		entrance.Cell.Floor
 	)
-	self:_move(self._squads[1], { entrance.Outside, doorway }, "Enter", now)
+	self:_move(self._squads[1], flatRoute({ entrance.Outside, doorway }, entrance.Cell.Floor), "Enter", now)
 end
 
 -- ===== Leg emission =========================================================
@@ -261,12 +312,12 @@ function NpcGroup:_orderForWalk(squad: Squad, points: { Vector3 })
 	if not standing or #standing ~= #squad.Members or #points < 2 then
 		return
 	end
-	local direction = points[2] - points[1]
-	if direction.Magnitude < 1e-3 then
+	local direction = groundDirection(points[1], points[2])
+	if not direction then
 		return
 	end
 
-	local slots = walkingPositions(squad, points[1], direction.Unit)
+	local slots = walkingPositions(squad, points[1], direction)
 	local matched = bestMatching(slots, standing)
 	local members, spots = {}, {}
 	for slot, member in matched do
@@ -277,48 +328,54 @@ function NpcGroup:_orderForWalk(squad: Squad, points: { Vector3 })
 	squad.Spots = spots
 end
 
---[[Starts a squad walking a polyline. The slowest member trails the leader by the group
+--[[Starts a squad walking a route. The slowest member trails the leader by the group
 stagger, so the whole squad has landed by EndTime.]]
-function NpcGroup:_move(squad: Squad, points: { Vector3 }, goal: Goal, now: number)
+function NpcGroup:_move(squad: Squad, route: SharedNpcService.Route, goal: Goal, now: number)
+	local points, floors = route.Points, route.Floors
 	local distance = polylineLength(points)
+	local arrivalFloor = floors[#floors] or squad.Floor
 	squad.State = "Move"
 	squad.Goal = goal
 	squad.Points = points
+	squad.Floors = floors
+	squad.Climbing = route.Climbing
 	squad.StartTime = now
 	-- Cleared here and re-set by _walkTo, so an off-grid leg never inherits the previous
 	-- leg's destination (which would make it look re-pathable when it isn't).
 	squad.Target = nil
+	squad.StuckSince = nil
+	-- On the move, so whatever they were stood in is free for anyone else.
+	self._world.ClearSpots(idsOf(squad))
+	-- How much room this route has for followers to walk beside the leader; a corridor
+	-- squeezes them onto the line itself, and so does a staircase. Measured BEFORE EndTime,
+	-- which pays for the resulting stagger: a leg that drops the party into single file
+	-- takes longer to clear, and timing it with the previous leg's spread told them to move
+	-- on while the back of the queue was still on the stairs.
+	squad.Spread = SharedNpcService:MeasureSpread(self._world.Grid, points, floors)
 	-- Guests ease away from a standstill and back into one rather than making the time up
 	-- with speed, so a leg takes a little longer to walk than its length suggests. Without
 	-- that allowance the squad is told to stop while it's still visibly arriving.
 	local easing = 2 * Npc.Movement.EaseDistance / self._speed
 	squad.EndTime = now
 		+ distance / self._speed
-		+ (#squad.Members - 1) * SharedNpcService:StaggerFor(squad.Spread or Npc.Movement.MemberSpread)
+		+ (#squad.Members - 1) * SharedNpcService:StaggerFor(squad.Spread)
 		+ easing
-	squad.StuckSince = nil
-	-- On the move, so whatever they were stood in is free for anyone else.
-	self._world.ClearSpots(idsOf(squad))
-	-- How much room this route has for followers to walk beside the leader; a corridor
-	-- squeezes them onto the line itself.
-	squad.Spread = SharedNpcService:MeasureSpread(self._world.Grid, points, Npc.FLOOR)
 	self:_orderForWalk(squad, points)
 	-- Legs that end in a stop hand out standing places up front, so the squad peels off
 	-- toward them over the last stretch instead of bunching up and then sorting itself out.
 	squad.Spots = if goal == "Action" or goal == "Wander"
-		then self:_stand(squad, points[#points], goal)
+		then self:_stand(squad, points[#points], goal, arrivalFloor)
 		else nil
 
 	self._world.Emit({
 		Kind = "Move",
 		GroupId = self.Id,
 		Ids = idsOf(squad),
-		Points = flatten(points),
-		Y = points[1].Y,
+		Points = flattenLine(points),
 		StartTime = now,
 		Speed = self._speed,
 		Spread = squad.Spread,
-		Spots = squad.Spots and flatten(squad.Spots),
+		Spots = squad.Spots and flattenSpots(squad.Spots),
 		FanOut = squad.Spots and Npc.Formation.FanOut,
 		-- Sent with the walk, not just the stop, so each guest turns to what they came to
 		-- see the moment they personally arrive instead of waiting for the whole party.
@@ -335,7 +392,7 @@ A squad that walked somewhere to look at something lines up facing it; one that 
 stopped rings the spot and talks. Called before the walk that ends there, so the places
 travel with the leg and the squad arrives already spread out.
 ]]
-function NpcGroup:_stand(squad: Squad, anchor: Vector3, goal: Goal): { Vector3 }
+function NpcGroup:_stand(squad: Squad, anchor: Vector3, goal: Goal, floor: number): { Vector3 }
 	-- Face is only set when there's something worth looking at.
 	local looking = squad.Face ~= nil
 	local facing = if looking then (squad.Face :: Vector3) - anchor else nil
@@ -355,7 +412,7 @@ function NpcGroup:_stand(squad: Squad, anchor: Vector3, goal: Goal): { Vector3 }
 		anchor,
 		facing or Vector3.xAxis,
 		#squad.Members,
-		Npc.FLOOR,
+		floor,
 		function(position: Vector3)
 			return world.SpotFree(position, mine)
 		end,
@@ -365,10 +422,10 @@ function NpcGroup:_stand(squad: Squad, anchor: Vector3, goal: Goal): { Vector3 }
 	-- Match places to members by where each of them will actually walk in, so the party
 	-- fans out into the formation rather than swapping past one another to reach it.
 	local approach = if squad.Points and #squad.Points > 1
-		then squad.Points[#squad.Points] - squad.Points[#squad.Points - 1]
-		else facing
-	if approach and approach.Magnitude > 1e-3 then
-		local arrivals = walkingPositions(squad, anchor, approach.Unit)
+		then groundDirection(squad.Points[#squad.Points - 1], squad.Points[#squad.Points])
+		else facing and groundDirection(Vector3.zero, facing)
+	if approach then
+		local arrivals = walkingPositions(squad, anchor, approach)
 		local matched = bestMatching(arrivals, spots)
 		local assigned = {}
 		for member, index in matched do
@@ -396,7 +453,7 @@ function NpcGroup:_idle(squad: Squad, duration: number, goal: Goal, now: number,
 	-- list is positional, so a stale one leaves somebody without a place at all.
 	local stale = squad.Spots ~= nil and #(squad.Spots :: { Vector3 }) ~= #squad.Members
 	if (not squad.Spots or stale) and duration >= Npc.Formation.MinIdle then
-		squad.Spots = self:_stand(squad, squad.Position, goal)
+		squad.Spots = self:_stand(squad, squad.Position, goal, squad.Floor)
 	elseif stale then
 		squad.Spots = nil
 	end
@@ -409,7 +466,7 @@ function NpcGroup:_idle(squad: Squad, duration: number, goal: Goal, now: number,
 		Duration = duration,
 		FaceX = face and face.X,
 		FaceZ = face and face.Z,
-		Spots = squad.Spots and flatten(squad.Spots),
+		Spots = squad.Spots and flattenSpots(squad.Spots),
 	})
 end
 
@@ -430,27 +487,28 @@ end
 
 -- ===== Target selection =====================================================
 
---[[Returns the cell a squad currently stands in.]]
-function NpcGroup:_cellOf(squad: Squad): SharedNpcService.Cell
-	return SharedNpcService:WorldToCell(self._world.Grid, squad.Position)
+--[[Returns the cell a squad currently stands in, on the level it is currently on.]]
+function NpcGroup:_cellOf(squad: Squad): SharedNpcService.Node
+	local cell = SharedNpcService:WorldToCell(self._world.Grid, squad.Position)
+	return { X = cell.X, Z = cell.Z, Floor = squad.Floor }
 end
 
---[[Walks a squad to a destination cell, stalling it if nothing legal connects them.]]
-function NpcGroup:_walkTo(squad: Squad, target: SharedNpcService.Cell, goal: Goal, now: number, face: Vector3?): boolean
-	local points = SharedNpcService:FindWalk(
+--[[Walks a squad to a destination cell, stalling it if nothing legal connects them. The
+route may change level on the way; the stairs it uses are part of the returned line.]]
+function NpcGroup:_walkTo(squad: Squad, target: SharedNpcService.Node, goal: Goal, now: number, face: Vector3?): boolean
+	local route = SharedNpcService:FindWalk(
 		self._world.Grid,
 		self:_cellOf(squad),
 		target,
-		Npc.FLOOR,
 		squad.Position,
 		self._world.CrowdCost
 	)
-	if not points or #points < 2 then
+	if not route or #route.Points < 2 then
 		self:_stall(squad, now)
 		return false
 	end
 	squad.Face = face
-	self:_move(squad, points, goal, now)
+	self:_move(squad, route, goal, now)
 	squad.Target = target
 	return true
 end
@@ -509,6 +567,7 @@ function NpcGroup:_maybeSplinter(now: number)
 		Members = leaving,
 		State = "Idle",
 		Goal = "Wandering",
+		Floor = main.Floor,
 		StartTime = now,
 		EndTime = now,
 		Position = main.Position,
@@ -609,7 +668,7 @@ function NpcGroup:_decide(squad: Squad, index: number, now: number)
 		local entrance = self._world.Entrance
 		if squad.Goal == "Leave" then
 			-- Through the door and back out of the approach lane, then gone.
-			self:_move(squad, { squad.Position, entrance.Outside }, "Exit", now)
+			self:_move(squad, flatRoute({ squad.Position, entrance.Outside }, squad.Floor), "Exit", now)
 		else
 			self:_walkTo(squad, entrance.Cell, "Leave", now)
 		end
@@ -636,26 +695,48 @@ function NpcGroup:_revalidate(squad: Squad, now: number)
 	if not squad.Target then
 		return
 	end
+	local points, floors, climbs = squad.Points, squad.Floors, squad.Climbing
+	local travelled = (now - squad.StartTime) * Npc.Movement.WalkSpeed
+	local at = segmentAt(points, travelled)
+
+	-- A squad already on the stairs has nowhere to re-path FROM: a staircase is not
+	-- somewhere anyone stands, so its cells are unwalkable and a search starting inside one
+	-- finds nothing and gives up. Climbs are always left to finish.
+	if climbs and climbs[at] then
+		return
+	end
 	squad.RevalidateAt = now + Npc.Nav.RevalidateInterval
 
+	-- The line still to walk, starting where the squad actually is. Each entry carries the
+	-- level it is on and whether the segment LEAVING it is inside a staircase.
 	local remaining = { squad.Position }
-	local travelled = (now - squad.StartTime) * Npc.Movement.WalkSpeed
+	local levels = { if floors then floors[at] else squad.Floor }
+	local inside = { if climbs then climbs[at] else false }
 	local covered = 0
-	for i = 2, #squad.Points do
-		covered += (squad.Points[i] - squad.Points[i - 1]).Magnitude
+	for i = 2, #points do
+		covered += (points[i] - points[i - 1]).Magnitude
 		if covered > travelled then
-			table.insert(remaining, squad.Points[i])
+			table.insert(remaining, points[i])
+			table.insert(levels, if floors then floors[i] else squad.Floor)
+			table.insert(inside, if climbs then climbs[i] else false)
 		end
 	end
 
 	-- Checked against the tighter radius the line was planned with, so a guest who merely
 	-- ends up near a new wall keeps walking instead of re-pathing every half second.
 	for i = 2, #remaining do
+		-- A staircase is a placement, not a route across cells: it has no floor line to
+		-- re-check, and its own cells are deliberately unwalkable, so checking one rejects a
+		-- route the guest is walking perfectly well. This covers the level stretches at each
+		-- end of a climb as well as the slope, which is why it is not a level comparison.
+		if inside[i - 1] or levels[i] ~= levels[i - 1] then
+			continue
+		end
 		local clear = SharedNpcService:IsLineWalkable(
 			self._world.Grid,
 			remaining[i - 1],
 			remaining[i],
-			Npc.FLOOR,
+			levels[i],
 			Npc.Nav.BlockedRadius
 		)
 		if not clear then
@@ -680,8 +761,14 @@ function NpcGroup:Tick(now: number)
 	for index = #self._squads, 1, -1 do
 		local squad = self._squads[index]
 		if squad.State == "Move" then
+			local points = squad.Points :: { Vector3 }
 			local travelled = (now - squad.StartTime) * Npc.Movement.WalkSpeed
-			squad.Position = sampleAt(squad.Points :: { Vector3 }, travelled)
+			squad.Position = sampleAt(points, travelled)
+			-- Mid-climb they count as still being on the level they set off from; cresting
+			-- the stairs is what moves them up.
+			if squad.Floors then
+				squad.Floor = squad.Floors[segmentAt(points, travelled)]
+			end
 		end
 
 		if squad.State == "Stuck" then
@@ -699,6 +786,9 @@ function NpcGroup:Tick(now: number)
 		elseif now >= squad.EndTime then
 			if squad.State == "Move" and squad.Points then
 				squad.Position = squad.Points[#squad.Points]
+				if squad.Floors then
+					squad.Floor = squad.Floors[#squad.Floors]
+				end
 			end
 			self:_decide(squad, index, now)
 		else
@@ -751,12 +841,11 @@ function NpcGroup:Snapshot(): { { [string]: any } }
 				Kind = "Move",
 				GroupId = self.Id,
 				Ids = idsOf(squad),
-				Points = flatten(squad.Points),
-				Y = squad.Points[1].Y,
+				Points = flattenLine(squad.Points),
 				StartTime = squad.StartTime,
 				Speed = self._speed,
 				Spread = squad.Spread,
-				Spots = squad.Spots and flatten(squad.Spots),
+				Spots = squad.Spots and flattenSpots(squad.Spots),
 				FanOut = squad.Spots and Npc.Formation.FanOut,
 			})
 		else
@@ -768,7 +857,7 @@ function NpcGroup:Snapshot(): { { [string]: any } }
 				Duration = squad.EndTime - squad.StartTime,
 				FaceX = squad.Face and squad.Face.X,
 				FaceZ = squad.Face and squad.Face.Z,
-				Spots = squad.Spots and flatten(squad.Spots),
+				Spots = squad.Spots and flattenSpots(squad.Spots),
 			})
 		end
 	end
