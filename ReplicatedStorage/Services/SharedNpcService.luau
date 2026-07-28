@@ -978,6 +978,12 @@ Picks a placed object worth looking at, skipping any id in `visited`, and return
 cell beside it (on its own level) plus the point to face while there, and the placement's
 id so the caller can mark it seen.
 
+A place only counts if the guest could STEP OUT of the object's cell into it, which is to
+say nothing solid stands between the two. Merely touching the footprint is not enough:
+walls sit on the edges BETWEEN cells, so an object pushed up against one has perfectly
+walkable cells on the far side of it, and a guest sent to one of those stands with their
+back to the room staring at the wall the object is hidden behind.
+
 Placeables carry no interaction data yet, so every content placement counts as something
 worth looking at. Once tanks, shops and info centers declare real interaction points -
 with their own capacities and durations - this is the function that learns to read them.
@@ -1000,12 +1006,20 @@ function SharedNpcService:PickAttraction(
 	local placement = candidates[math.random(1, #candidates)]
 	local floor = placement.Floor
 	local coords = SharedBuildingService:GetFootprintCoords(placement.Name, placement.X, placement.Z, placement.Rotation)
-	local spots = {}
+	local view = makeView(grid)
+	local spots: { { Node: Node, Face: Vector3 } } = {}
 	for _, coord in coords do
 		for _, offset in { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } } do
-			local x, z = coord[1] + offset[1], coord[2] + offset[2]
-			if self:IsCellWalkable(grid, x, z, floor) then
-				table.insert(spots, { X = x, Z = z, Floor = floor })
+			-- The step is tested outward from the object rather than the two cells being
+			-- checked in isolation: the object's own cell is not walkable (it is filled by
+			-- the placement), so only the step carries the edge between them.
+			if viewStep(view, coord[1], coord[2], floor, offset[1], offset[2]) then
+				table.insert(spots, {
+					Node = { X = coord[1] + offset[1], Z = coord[2] + offset[2], Floor = floor },
+					-- Face the cell they are actually stood against, not the placement's
+					-- anchor, which on a long object can be several cells away along it.
+					Face = self:CellToWorld(grid, coord[1], coord[2], floor),
+				})
 			end
 		end
 	end
@@ -1013,9 +1027,8 @@ function SharedNpcService:PickAttraction(
 		return nil
 	end
 
-	return spots[math.random(1, #spots)],
-		self:CellToWorld(grid, placement.X, placement.Z, floor),
-		placement.Id
+	local chosen = spots[math.random(1, #spots)]
+	return chosen.Node, chosen.Face, placement.Id
 end
 
 --[[
