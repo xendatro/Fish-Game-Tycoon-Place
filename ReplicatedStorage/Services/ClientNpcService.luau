@@ -256,20 +256,20 @@ local function createGuest(id: number, groupId: number, asset: string, position:
 	local humanoid = model:FindFirstChildOfClass("Humanoid") :: Humanoid
 	local animator = humanoid:FindFirstChildOfClass("Animator") :: Animator
 
+	-- Invisible until the fade-in starts, so a guest never shows for the frame between
+	-- being parented in and the fade's first step.
 	for _, part in model:GetDescendants() do
 		if part:IsA("BasePart") then
-			part.CanCollide = false
-			part.CanQuery = false
-			part.CanTouch = false
 			part.LocalTransparencyModifier = 1
 		end
 	end
 	root.Anchored = true
 	humanoid.AutoRotate = false
 	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-	-- The root is driven by hand, so park the state machine rather than letting it decide
-	-- the guest is falling.
-	humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+	-- The root is driven by hand, so the humanoid has no business deciding this guest is
+	-- falling, landing or running. Off before it is parented in, because the moment it
+	-- enters the world the machine would otherwise run - and re-collide the rig.
+	humanoid.EvaluateStateMachine = false
 
 	-- Rest the model's feet on the walking surface whatever its rig scale or hip height.
 	local boundingCFrame, boundingSize = model:GetBoundingBox()
@@ -278,6 +278,24 @@ local function createGuest(id: number, groupId: number, asset: string, position:
 	model.Name = `Guest_{id}`
 	root.CFrame = CFrame.lookAt(position + Vector3.new(0, height, 0), position + Vector3.new(0, height, 0) + facing)
 	model.Parent = getContainer()
+
+	--[[
+	Guests are scenery: nothing about them should block, hit or be hit by the player, and
+	nothing about them should answer a raycast the build tools cast through them.
+
+	This has to happen AFTER parenting. A humanoid takes over its rig's physics the moment
+	it enters the world, and setting up as the character it thinks it is includes putting
+	CanCollide back - so anything set on the clone beforehand is undone at exactly the
+	point the guest appears. Parking the state in Physics keeps it that way.
+	]]
+	humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.CanCollide = false
+			part.CanQuery = false
+			part.CanTouch = false
+		end
+	end
 
 	-- Tracks have to be loaded once the model is in the world; an Animator that isn't
 	-- there yet hands back a track that plays at zero weight forever. The Animate script
